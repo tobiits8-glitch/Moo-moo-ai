@@ -92,6 +92,24 @@ jobs:
           fi
           echo "Temporary ./debug.keystore is ready."
 
+      - name: Verify google-services.json
+        shell: bash
+        env:
+          GOOGLE_SERVICES_JSON_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "app/google-services.json" ] && [ -n "${GOOGLE_SERVICES_JSON_SECRET:-}" ]; then
+            printf '%s\n' "$GOOGLE_SERVICES_JSON_SECRET" > app/google-services.json
+            echo "Restored app/google-services.json from GOOGLE_SERVICES_JSON secret."
+          fi
+
+          if [ ! -s "app/google-services.json" ]; then
+            echo "::error::app/google-services.json is missing. Commit app/google-services.json to the repository (or set GOOGLE_SERVICES_JSON in GitHub Secrets) so Firebase is packaged into the APK."
+            exit 1
+          fi
+
+          echo "Verified app/google-services.json is present ($(wc -c < app/google-services.json) bytes)."
+
       - name: Build debug APK
         shell: bash
         run: |
@@ -120,7 +138,13 @@ jobs:
             exit 1
           fi
 
-          echo "Verified debug APK: $APK_PATH ($(wc -c < "$APK_PATH") bytes)"
+          GENERATED_FIREBASE_RES="app/build/generated/res/processDebugGoogleServices/values/values.xml"
+          if [ ! -f "$GENERATED_FIREBASE_RES" ] || ! grep -q 'name="google_app_id"' "$GENERATED_FIREBASE_RES"; then
+            echo "::error::Firebase resources (google_app_id) were not packaged from app/google-services.json into the debug APK."
+            exit 1
+          fi
+
+          echo "Verified debug APK: $APK_PATH ($(wc -c < "$APK_PATH") bytes) with Firebase configuration packaged."
 
       - name: Upload debug APK artifact
         id: upload_artifact
