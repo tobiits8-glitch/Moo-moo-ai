@@ -1,0 +1,6 @@
+{
+  "name": "Moo Moo",
+  "description": "Personal AI chat assistant named Moo Moo with multi-turn conversations, custom moods, and multimodal image support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
