@@ -165,6 +165,7 @@ fun ChatScreen(
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val prefs by viewModel.userPreferences.collectAsStateWithLifecycle()
 
+    val context = LocalContext.current
     var showCustomizeSheet by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -223,9 +224,17 @@ fun ChatScreen(
                 onSelectMood = viewModel::setMood,
                 onComposerTextChange = viewModel::updateComposerText,
                 onPickImage = {
-                    photoPickerLauncher.launch(
-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                    )
+                    runCatching {
+                        photoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    }.onFailure {
+                        Toast.makeText(
+                            context,
+                            "No photo picker available on this device.",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
                 },
                 onClearPendingImage = viewModel::clearPendingImage,
                 onSendMessage = { viewModel.sendMessage() },
@@ -369,53 +378,80 @@ private fun ChatMainPane(
         }
         pendingSpeakMessage = messageId to text
         if (existing == null) {
-            var created: TextToSpeech? = null
-            created = TextToSpeech(context.applicationContext) { status ->
-                if (status == TextToSpeech.SUCCESS) {
-                    created?.language = Locale.getDefault()
-                    mainHandler.post {
-                        ttsReady = true
-                        val pending = pendingSpeakMessage
-                        if (pending != null && speakingMessageId == pending.first) {
+            runCatching {
+                var created: TextToSpeech? = null
+                created = TextToSpeech(context.applicationContext) { status ->
+                    if (status == TextToSpeech.SUCCESS) {
+                        runCatching { created?.language = Locale.getDefault() }
+                        mainHandler.post {
+                            ttsReady = true
+                            val pending = pendingSpeakMessage
+                            if (pending != null && speakingMessageId == pending.first) {
+                                pendingSpeakMessage = null
+                                runCatching {
+                                    created?.speak(
+                                        pending.second,
+                                        TextToSpeech.QUEUE_FLUSH,
+                                        null,
+                                        pending.first
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        mainHandler.post {
                             pendingSpeakMessage = null
-                            created?.speak(pending.second, TextToSpeech.QUEUE_FLUSH, null, pending.first)
+                            speakingMessageId = null
+                            Toast.makeText(
+                                context,
+                                "Text-to-speech is not available on this phone.",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
                     }
                 }
+                created.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) {
+                        mainHandler.post {
+                            if (speakingMessageId == utteranceId) {
+                                speakingMessageId = null
+                            }
+                        }
+                    }
+                    override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                        mainHandler.post {
+                            if (speakingMessageId == utteranceId) {
+                                speakingMessageId = null
+                            }
+                        }
+                    }
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        mainHandler.post {
+                            if (speakingMessageId == utteranceId) {
+                                speakingMessageId = null
+                            }
+                        }
+                    }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        mainHandler.post {
+                            if (speakingMessageId == utteranceId) {
+                                speakingMessageId = null
+                            }
+                        }
+                    }
+                })
+                ttsEngine = created
+            }.onFailure {
+                pendingSpeakMessage = null
+                speakingMessageId = null
+                Toast.makeText(
+                    context,
+                    "Text-to-speech is not available on this phone.",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
-            created.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    mainHandler.post {
-                        if (speakingMessageId == utteranceId) {
-                            speakingMessageId = null
-                        }
-                    }
-                }
-                override fun onStop(utteranceId: String?, interrupted: Boolean) {
-                    mainHandler.post {
-                        if (speakingMessageId == utteranceId) {
-                            speakingMessageId = null
-                        }
-                    }
-                }
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    mainHandler.post {
-                        if (speakingMessageId == utteranceId) {
-                            speakingMessageId = null
-                        }
-                    }
-                }
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    mainHandler.post {
-                        if (speakingMessageId == utteranceId) {
-                            speakingMessageId = null
-                        }
-                    }
-                }
-            })
-            ttsEngine = created
         }
     }
 
@@ -849,42 +885,45 @@ private fun MooMooWelcomeView(
 
         Spacer(modifier = Modifier.height(18.dp))
 
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            defaultStarterPrompts.chunked(2).forEach { rowItems ->
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    rowItems.forEach { starter ->
-                        Surface(
-                            color = MaterialTheme.colorScheme.surfaceContainerLow,
-                            shape = RoundedCornerShape(20.dp),
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(20.dp))
-                                .clickable { onStarterPromptClick(starter.prompt) }
-                                .testTag("starter_prompt_${starter.title.lowercase().replace(" ", "_")}")
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(14.dp),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val columns = if (maxWidth < 340.dp) 1 else 2
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                defaultStarterPrompts.chunked(columns).forEach { rowItems ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        rowItems.forEach { starter ->
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                shape = RoundedCornerShape(20.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .clickable { onStarterPromptClick(starter.prompt) }
+                                    .testTag("starter_prompt_${starter.title.lowercase().replace(" ", "_")}")
                             ) {
-                                Text(
-                                    text = starter.title,
-                                    style = MaterialTheme.typography.titleSmall,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = starter.subtitle,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = starter.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = starter.subtitle,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     }
@@ -1058,11 +1097,19 @@ private fun ChatMessageBubble(
 
                     IconButton(
                         onClick = {
-                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"
-                                putExtra(Intent.EXTRA_TEXT, message.text)
+                            runCatching {
+                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, message.text)
+                                }
+                                context.startActivity(Intent.createChooser(sendIntent, null))
+                            }.onFailure {
+                                Toast.makeText(
+                                    context,
+                                    "Unable to share on this device.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
                             }
-                            context.startActivity(Intent.createChooser(sendIntent, null))
                         },
                         modifier = Modifier.minimumInteractiveComponentSize()
                     ) {

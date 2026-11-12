@@ -23,7 +23,10 @@ abstract class MooMooDatabase : RoomDatabase() {
                     context.applicationContext,
                     MooMooDatabase::class.java,
                     "moomoo_chat.db"
-                ).build().also { INSTANCE = it }
+                )
+                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .build()
+                    .also { INSTANCE = it }
             }
         }
     }

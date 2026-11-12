@@ -5,14 +5,20 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.util.Log
+import com.example.ai.configureAppCheck
+import com.example.ai.ensureFirebaseInitialized
 import com.example.data.local.ChatDao
 import com.example.data.local.ConversationEntity
 import com.example.data.local.MessageEntity
 import com.example.model.MooMooModelTier
 import com.example.model.MooMooMood
 import com.google.firebase.Firebase
+import com.google.firebase.FirebaseApp
+import com.google.firebase.ai.FirebaseAI
 import com.google.firebase.ai.GenerativeModel
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.Content
@@ -45,7 +51,10 @@ class MooMooChatRepository(
     private val context: Context,
     private val chatDao: ChatDao
 ) {
-    private val firebaseAi by lazy { Firebase.ai }
+    private val firebaseAi: FirebaseAI by lazy {
+        ensureFirebaseReadyOrThrow()
+        Firebase.ai
+    }
     private val modelCache = ConcurrentHashMap<Triple<String, String, String>, GenerativeModel>()
 
     private val titleModel: GenerativeModel by lazy {
@@ -56,6 +65,27 @@ class MooMooChatRepository(
                 maxOutputTokens = 24
             }
         )
+    }
+
+    private fun ensureFirebaseReadyOrThrow() {
+        val appContext = context.applicationContext ?: context
+        if (FirebaseApp.getApps(appContext).isEmpty()) {
+            configureAppCheck(appContext, null)
+        }
+        if (!ensureFirebaseInitialized(appContext)) {
+            throw IllegalStateException(
+                "Firebase is not configured in this APK build (missing google-services.json). " +
+                    "Ensure google-services.json is included before building."
+            )
+        }
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return true
+        val activeNetwork = cm.activeNetwork ?: return false
+        val capabilities = cm.getNetworkCapabilities(activeNetwork) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     private fun buildSystemInstruction(mood: MooMooMood, customInstruction: String): Content {
@@ -152,8 +182,19 @@ class MooMooChatRepository(
     suspend fun persistAttachment(uri: Uri): String? = withContext(Dispatchers.IO) {
         runCatching {
             val attachmentsDir = File(context.filesDir, "attachments").apply { mkdirs() }
+            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            }
+
+            val sampleSize = computeInSampleSize(
+                width = boundsOptions.outWidth,
+                height = boundsOptions.outHeight,
+                maxDim = MAX_IMAGE_DIM
+            )
+            val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
             val originalBitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream)
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
             } ?: return@withContext null
 
             val orientedBitmap = rotateBitmapIfNeeded(uri, originalBitmap)
@@ -174,6 +215,19 @@ class MooMooChatRepository(
         }.onFailure { e ->
             Log.e(TAG, "Failed to persist attached photo", e)
         }.getOrNull()
+    }
+
+    private fun computeInSampleSize(width: Int, height: Int, maxDim: Int): Int {
+        if (width <= 0 || height <= 0) return 1
+        var sampleSize = 1
+        var curW = width
+        var curH = height
+        while (maxOf(curW, curH) / 2 >= maxDim) {
+            curW /= 2
+            curH /= 2
+            sampleSize *= 2
+        }
+        return sampleSize.coerceAtLeast(1)
     }
 
     private fun rotateBitmapIfNeeded(uri: Uri, bitmap: Bitmap): Bitmap {
@@ -331,6 +385,13 @@ class MooMooChatRepository(
             }
         }
 
+        if (!isNetworkAvailable()) {
+            throw IllegalStateException(
+                "You appear to be offline. Connect to Wi-Fi or mobile data and tap Try again."
+            )
+        }
+
+        ensureFirebaseReadyOrThrow()
         logAppCheckDiagnosticAsync()
 
         val primaryModel = getOrCreateModel(modelTier, mood, customInstruction)

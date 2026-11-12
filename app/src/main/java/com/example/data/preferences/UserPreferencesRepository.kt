@@ -4,12 +4,15 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.model.MooMooModelTier
 import com.example.model.MooMooMood
 import com.example.ui.theme.ThemeMode
+import java.io.IOException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "moomoo_prefs")
@@ -29,20 +32,28 @@ class UserPreferencesRepository(private val context: Context) {
         val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 
-    val preferences: Flow<UserPreferences> = context.dataStore.data.map { prefs ->
-        val mood = MooMooMood.fromId(prefs[Keys.MOOD_ID] ?: MooMooMood.CLASSIC.id)
-        val modelTier = MooMooModelTier.fromId(prefs[Keys.MODEL_TIER_ID] ?: MooMooModelTier.SMART.id)
-        val custom = prefs[Keys.CUSTOM_INSTRUCTION] ?: ""
-        val theme = runCatching {
-            ThemeMode.valueOf(prefs[Keys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
-        }.getOrDefault(ThemeMode.SYSTEM)
-        UserPreferences(
-            mood = mood,
-            modelTier = modelTier,
-            customInstruction = custom,
-            themeMode = theme
-        )
-    }
+    val preferences: Flow<UserPreferences> = context.dataStore.data
+        .catch { exception ->
+            if (exception is IOException) {
+                emit(emptyPreferences())
+            } else {
+                throw exception
+            }
+        }
+        .map { prefs ->
+            val mood = MooMooMood.fromId(prefs[Keys.MOOD_ID] ?: MooMooMood.CLASSIC.id)
+            val modelTier = MooMooModelTier.fromId(prefs[Keys.MODEL_TIER_ID] ?: MooMooModelTier.SMART.id)
+            val custom = prefs[Keys.CUSTOM_INSTRUCTION] ?: ""
+            val theme = runCatching {
+                ThemeMode.valueOf(prefs[Keys.THEME_MODE] ?: ThemeMode.SYSTEM.name)
+            }.getOrDefault(ThemeMode.SYSTEM)
+            UserPreferences(
+                mood = mood,
+                modelTier = modelTier,
+                customInstruction = custom,
+                themeMode = theme
+            )
+        }
 
     suspend fun setMood(mood: MooMooMood) {
         context.dataStore.edit { it[Keys.MOOD_ID] = mood.id }
