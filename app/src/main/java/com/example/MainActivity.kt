@@ -6,11 +6,16 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.credentials.CredentialManager
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -59,34 +64,69 @@ private fun MooMooApp() {
     )
     val scope = rememberCoroutineScope()
     val credentialManager = remember(context) { CredentialManager.create(context) }
+    var isGuestSession by rememberSaveable { mutableStateOf(false) }
+
+    LaunchedEffect(currentUser) {
+        if (currentUser != null) {
+            isGuestSession = false
+        }
+    }
 
     MooMooTheme(themeMode = prefs.themeMode) {
         val user = currentUser
-        if (user == null) {
-            AuthScreen(
-                onAuthSuccess = { /* authStateFlow emits the signed-in FirebaseUser */ }
-            )
-        } else {
-            val uid = user.uid
-            key(uid) {
-                val chatViewModel: ChatViewModel = viewModel(
-                    key = uid,
-                    factory = ChatViewModel.Factory(
-                        appContext = appContext,
-                        currentUserId = uid,
-                        userDisplayName = user.displayName.orEmpty(),
-                        userEmail = user.email.orEmpty(),
-                        userPhotoUrl = user.photoUrl?.toString()
-                    )
-                )
-                ChatScreen(
-                    viewModel = chatViewModel,
-                    onSignOut = {
-                        signOutFromMooMoo(
-                            credentialManager = credentialManager,
-                            scope = scope
+        when {
+            user != null -> {
+                val uid = user.uid
+                key(uid) {
+                    val chatViewModel: ChatViewModel = viewModel(
+                        key = uid,
+                        factory = ChatViewModel.Factory(
+                            appContext = appContext,
+                            currentUserId = uid,
+                            userDisplayName = user.displayName.orEmpty(),
+                            userEmail = user.email.orEmpty(),
+                            userPhotoUrl = user.photoUrl?.toString(),
+                            isGuest = false
                         )
-                    }
+                    )
+                    ChatScreen(
+                        viewModel = chatViewModel,
+                        onSignOut = {
+                            signOutFromMooMoo(
+                                credentialManager = credentialManager,
+                                scope = scope
+                            )
+                        }
+                    )
+                }
+            }
+
+            isGuestSession -> {
+                val guestDisplayName = stringResource(R.string.guest_display_name)
+                val guestEmailLabel = stringResource(R.string.guest_email_label)
+                key("guest_session") {
+                    val chatViewModel: ChatViewModel = viewModel(
+                        key = "guest_session",
+                        factory = ChatViewModel.Factory(
+                            appContext = appContext,
+                            currentUserId = "guest_local",
+                            userDisplayName = guestDisplayName,
+                            userEmail = guestEmailLabel,
+                            userPhotoUrl = null,
+                            isGuest = true
+                        )
+                    )
+                    ChatScreen(
+                        viewModel = chatViewModel,
+                        onSignOut = { isGuestSession = false }
+                    )
+                }
+            }
+
+            else -> {
+                AuthScreen(
+                    onAuthSuccess = { /* authStateFlow emits the signed-in FirebaseUser */ },
+                    onContinueAsGuest = { isGuestSession = true }
                 )
             }
         }

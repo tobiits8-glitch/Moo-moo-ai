@@ -27,11 +27,13 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CloudDone
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PersonOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -60,6 +62,7 @@ import com.example.R
 @Composable
 fun AuthScreen(
     onAuthSuccess: () -> Unit,
+    onContinueAsGuest: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -108,14 +111,14 @@ fun AuthScreen(
                 .widthIn(max = 460.dp)
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(18.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Surface(
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.surfaceContainerLow,
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
                 tonalElevation = 2.dp,
-                modifier = Modifier.size(116.dp)
+                modifier = Modifier.size(112.dp)
             ) {
                 Image(
                     painter = painterResource(id = R.drawable.img_moomoo_mascot),
@@ -198,61 +201,111 @@ fun AuthScreen(
                 }
             }
 
-            Button(
-                onClick = {
-                    errorMessage = null
-                    isSigningIn = true
-                    onGoogleSignInClicked(
-                        context = context,
-                        credentialManager = credentialManager,
-                        onAuthSuccess = {
-                            isSigningIn = false
-                            onAuthSuccess()
-                        },
-                        onAuthError = { message ->
-                            isSigningIn = false
-                            errorMessage = message
-                        },
-                        scope = scope,
-                        onAuthCancelled = {
-                            isSigningIn = false
-                        }
-                    )
-                },
-                enabled = !isSigningIn && !isCheckingSilentAuth,
-                shape = RoundedCornerShape(18.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-                    .minimumInteractiveComponentSize()
-                    .testTag("google_sign_in_button")
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (isSigningIn || isCheckingSilentAuth) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        strokeWidth = 2.5.dp
+                Button(
+                    onClick = {
+                        errorMessage = null
+                        isSigningIn = true
+                        onGoogleSignInClicked(
+                            context = context,
+                            credentialManager = credentialManager,
+                            onAuthSuccess = {
+                                isSigningIn = false
+                                onAuthSuccess()
+                            },
+                            onAuthError = { message ->
+                                isSigningIn = false
+                                errorMessage = message
+                            },
+                            scope = scope,
+                            onAuthCancelled = {
+                                isSigningIn = false
+                            }
+                        )
+                    },
+                    enabled = !isSigningIn && !isCheckingSilentAuth,
+                    shape = RoundedCornerShape(18.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp)
+                        .minimumInteractiveComponentSize()
+                        .testTag("google_sign_in_button")
+                ) {
+                    if (isSigningIn || isCheckingSilentAuth) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(22.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            strokeWidth = 2.5.dp
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = if (isCheckingSilentAuth) {
+                                stringResource(R.string.auth_checking_session)
+                            } else {
+                                stringResource(R.string.auth_signing_in)
+                            },
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                    } else {
+                        Text(
+                            text = stringResource(R.string.auth_sign_in_google),
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
+                        )
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        isCheckingSilentAuth = false
+                        onContinueAsGuest()
+                    },
+                    enabled = !isSigningIn,
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp)
+                        .minimumInteractiveComponentSize()
+                        .testTag("guest_sign_in_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.PersonOutline,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
                     )
-                    Spacer(modifier = Modifier.width(12.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (isCheckingSilentAuth) {
-                            stringResource(R.string.auth_checking_session)
-                        } else {
-                            stringResource(R.string.auth_signing_in)
-                        },
-                        style = MaterialTheme.typography.titleSmall
-                    )
-                } else {
-                    Text(
-                        text = stringResource(R.string.auth_sign_in_google),
-                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
+                        text = stringResource(R.string.auth_continue_guest),
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Medium)
                     )
                 }
+
+                Text(
+                    text = stringResource(R.string.auth_guest_note),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                )
             }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = stringResource(R.string.developer_credit),
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.testTag("developer_credit_auth")
+            )
         }
     }
 }

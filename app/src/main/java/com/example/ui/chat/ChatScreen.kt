@@ -202,6 +202,7 @@ fun ChatScreen(
                 searchQuery = searchQuery,
                 userDisplayName = viewModel.userDisplayName,
                 userEmail = viewModel.userEmail,
+                isGuest = viewModel.isGuest,
                 onSearchQueryChange = viewModel::updateSearchQuery,
                 onNewChat = {
                     viewModel.startNewChat()

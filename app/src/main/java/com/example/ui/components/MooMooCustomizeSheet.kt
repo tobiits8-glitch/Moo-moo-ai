@@ -21,6 +21,7 @@ import androidx.compose.material.icons.rounded.Psychology
 import androidx.compose.material.icons.rounded.School
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -38,6 +39,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.model.MooMooModelTier
@@ -273,6 +275,18 @@ fun MooMooCustomizeSheet(
                     }
                 }
             }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+
+            Text(
+                text = stringResource(R.string.developer_credit),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("developer_credit_sheet")
+            )
         }
     }
 }

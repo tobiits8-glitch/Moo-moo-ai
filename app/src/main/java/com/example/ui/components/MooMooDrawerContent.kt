@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Login
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.DeleteOutline
@@ -70,6 +71,7 @@ fun MooMooDrawerContent(
     searchQuery: String,
     userDisplayName: String,
     userEmail: String,
+    isGuest: Boolean,
     onSearchQueryChange: (String) -> Unit,
     onNewChat: () -> Unit,
     onSelectConversation: (String) -> Unit,
@@ -301,17 +303,34 @@ fun MooMooDrawerContent(
                         .testTag("sign_out_button")
                 ) {
                     Icon(
-                        imageVector = Icons.AutoMirrored.Outlined.Logout,
-                        contentDescription = stringResource(R.string.cd_sign_out),
+                        imageVector = if (isGuest) {
+                            Icons.AutoMirrored.Outlined.Login
+                        } else {
+                            Icons.AutoMirrored.Outlined.Logout
+                        },
+                        contentDescription = stringResource(
+                            if (isGuest) R.string.cd_sign_in else R.string.cd_sign_out
+                        ),
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = stringResource(R.string.drawer_sign_out),
+                        text = stringResource(
+                            if (isGuest) R.string.drawer_sign_in else R.string.drawer_sign_out
+                        ),
                         style = MaterialTheme.typography.labelMedium
                     )
                 }
             }
+
+            Text(
+                text = stringResource(R.string.developer_credit),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                modifier = Modifier
+                    .padding(start = 4.dp, end = 4.dp, top = 6.dp)
+                    .testTag("developer_credit_drawer")
+            )
         }
     }
 }

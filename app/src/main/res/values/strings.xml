@@ -52,4 +52,11 @@
     <string name="auth_checking_session">Checking session…</string>
     <string name="drawer_sign_out">Sign Out</string>
     <string name="cd_sign_out">Sign out of Google account</string>
+    <string name="auth_continue_guest">Continue as Guest</string>
+    <string name="auth_guest_note">Guest chats stay on this device. Sign in with Google anytime to sync to the cloud.</string>
+    <string name="guest_display_name">Guest</string>
+    <string name="guest_email_label">Local session (not synced)</string>
+    <string name="drawer_sign_in">Sign In</string>
+    <string name="cd_sign_in">Sign in with Google</string>
+    <string name="developer_credit">Developed by Hemanth HS</string>
 </resources>

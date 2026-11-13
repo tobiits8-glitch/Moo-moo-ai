@@ -46,6 +46,7 @@ import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.timeout
@@ -61,18 +62,46 @@ private const val STREAM_TOTAL_TIMEOUT_MS = 60_000L
 private const val UNARY_TIMEOUT_MS = 20_000L
 private const val MAX_IMAGE_DIM = 1280
 
-class MooMooChatRepository(
+class MooMooChatRepository private constructor(
     private val appContext: Context,
-    private val db: FirebaseFirestore,
-    private val auth: FirebaseAuth = Firebase.auth
+    private val db: FirebaseFirestore?,
+    private val auth: FirebaseAuth?,
+    private val guestStore: GuestChatStore?
 ) {
+    constructor(
+        appContext: Context,
+        db: FirebaseFirestore,
+        auth: FirebaseAuth = Firebase.auth
+    ) : this(
+        appContext = appContext.applicationContext ?: appContext,
+        db = db,
+        auth = auth,
+        guestStore = null
+    )
+
     constructor(context: Context) : this(
         appContext = context.applicationContext ?: context,
         db = FirebaseFirestore.getInstance(
             (context.applicationContext ?: context).getString(R.string.firestore_database_id)
         ),
-        auth = Firebase.auth
+        auth = Firebase.auth,
+        guestStore = null
     )
+
+    companion object {
+        fun createGuest(context: Context): MooMooChatRepository {
+            val appCtx = context.applicationContext ?: context
+            return MooMooChatRepository(
+                appContext = appCtx,
+                db = null,
+                auth = null,
+                guestStore = GuestChatStore(appCtx)
+            )
+        }
+    }
+
+    private val isGuestMode: Boolean
+        get() = guestStore != null
 
     private val firebaseAi: FirebaseAI by lazy {
         ensureFirebaseReadyOrThrow()
@@ -90,18 +119,25 @@ class MooMooChatRepository(
         )
     }
 
+    private fun requireDb(): FirebaseFirestore =
+        checkNotNull(db) { "Firestore is unavailable in Guest mode." }
+
     private fun requireUserId(): String {
-        return auth.currentUser?.uid
+        return auth?.currentUser?.uid
             ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
     }
 
-    private fun userDocRef(userId: String) = db.collection("users").document(userId)
+    private fun userDocRef(userId: String) = requireDb().collection("users").document(userId)
 
     private fun conversationsCollection(userId: String) =
         userDocRef(userId).collection("conversations")
 
     private fun messagesCollection(userId: String, conversationId: String) =
         conversationsCollection(userId).document(conversationId).collection("messages")
+
+    suspend fun initGuestStoreIfNeeded() {
+        guestStore?.initIfNeeded()
+    }
 
     private fun ensureFirebaseReadyOrThrow() {
         if (FirebaseApp.getApps(appContext).isEmpty()) {
@@ -124,6 +160,7 @@ class MooMooChatRepository(
     }
 
     fun observeUserProfile(userId: String): Flow<UserProfile?> {
+        if (isGuestMode) return flowOf(null)
         val docRef = userDocRef(userId)
         return docRef.snapshots()
             .map { snapshot ->
@@ -142,7 +179,7 @@ class MooMooChatRepository(
                     .firstOrNull()
                 if (firestoreError == null && error is CancellationException) throw error
                 val exceptionToLog = firestoreError ?: (error as? Exception)
-                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                if (exceptionToLog != null && auth?.currentUser?.uid == userId) {
                     handleFirestoreError(exceptionToLog, OperationType.GET, docRef.path)
                 }
                 throw error
@@ -157,6 +194,7 @@ class MooMooChatRepository(
         defaultTier: MooMooModelTier,
         defaultCustomInstruction: String
     ) {
+        if (isGuestMode) return
         val uid = requireUserId()
         val docRef = userDocRef(uid)
         try {
@@ -200,6 +238,7 @@ class MooMooChatRepository(
         modelTier: MooMooModelTier,
         customInstruction: String
     ) {
+        if (isGuestMode) return
         val uid = requireUserId()
         val docRef = userDocRef(uid)
         val updates = mapOf(
@@ -219,6 +258,7 @@ class MooMooChatRepository(
     }
 
     fun observeConversations(userId: String): Flow<List<ConversationRecord>> {
+        guestStore?.let { return it.observeConversations() }
         val colRef = conversationsCollection(userId)
         return colRef
             .orderBy("updatedAt", Query.Direction.DESCENDING)
@@ -235,7 +275,7 @@ class MooMooChatRepository(
                     .firstOrNull()
                 if (firestoreError == null && error is CancellationException) throw error
                 val exceptionToLog = firestoreError ?: (error as? Exception)
-                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                if (exceptionToLog != null && auth?.currentUser?.uid == userId) {
                     handleFirestoreError(exceptionToLog, OperationType.LIST, colRef.path)
                 }
                 throw error
@@ -243,6 +283,7 @@ class MooMooChatRepository(
     }
 
     fun observeMessages(userId: String, conversationId: String): Flow<List<ChatMessageRecord>> {
+        guestStore?.let { return it.observeMessages(conversationId) }
         val colRef = messagesCollection(userId, conversationId)
         return colRef
             .orderBy("createdAt", Query.Direction.ASCENDING)
@@ -259,7 +300,7 @@ class MooMooChatRepository(
                     .firstOrNull()
                 if (firestoreError == null && error is CancellationException) throw error
                 val exceptionToLog = firestoreError ?: (error as? Exception)
-                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                if (exceptionToLog != null && auth?.currentUser?.uid == userId) {
                     handleFirestoreError(exceptionToLog, OperationType.LIST, colRef.path)
                 }
                 throw error
@@ -267,6 +308,7 @@ class MooMooChatRepository(
     }
 
     suspend fun getConversation(userId: String, conversationId: String): ConversationRecord? {
+        guestStore?.let { return it.getConversation(conversationId) }
         val docRef = conversationsCollection(userId).document(conversationId)
         return try {
             docRef.get().await().toObject(
@@ -282,6 +324,7 @@ class MooMooChatRepository(
     }
 
     suspend fun createConversation(title: String, mood: MooMooMood): ConversationRecord {
+        guestStore?.let { return it.createConversation(title, mood) }
         val uid = requireUserId()
         val convId = UUID.randomUUID().toString()
         val safeTitle = title.trim().ifBlank { "New Chat" }.take(120)
@@ -310,6 +353,10 @@ class MooMooChatRepository(
     }
 
     suspend fun updateConversationMood(conversationId: String, mood: MooMooMood) {
+        guestStore?.let {
+            it.updateConversationMood(conversationId, mood)
+            return
+        }
         val uid = requireUserId()
         val docRef = conversationsCollection(uid).document(conversationId)
         try {
@@ -328,7 +375,12 @@ class MooMooChatRepository(
     }
 
     suspend fun deleteConversation(conversationId: String) {
+        guestStore?.let {
+            it.deleteConversation(conversationId)
+            return
+        }
         val uid = requireUserId()
+        val firestore = requireDb()
         val convRef = conversationsCollection(uid).document(conversationId)
         val msgsCol = messagesCollection(uid, conversationId)
         try {
@@ -344,7 +396,7 @@ class MooMooChatRepository(
             }
             val msgRefs = msgSnapshots.documents.map { it.reference }
             msgRefs.chunked(400).forEach { chunk ->
-                db.runBatch { batch ->
+                firestore.runBatch { batch ->
                     chunk.forEach { batch.delete(it) }
                 }.await()
             }
@@ -364,7 +416,9 @@ class MooMooChatRepository(
         imagePath: String? = null,
         isError: Boolean = false
     ): ChatMessageRecord {
+        guestStore?.let { return it.saveMessage(conversationId, role, text, imagePath, isError) }
         val uid = requireUserId()
+        val firestore = requireDb()
         val msgId = UUID.randomUUID().toString()
         val convRef = conversationsCollection(uid).document(conversationId)
         val msgRef = messagesCollection(uid, conversationId).document(msgId)
@@ -381,7 +435,7 @@ class MooMooChatRepository(
         ).filterValues { it != null }
 
         try {
-            db.runBatch { batch ->
+            firestore.runBatch { batch ->
                 batch.set(msgRef, payload)
                 batch.update(convRef, mapOf("updatedAt" to FieldValue.serverTimestamp()))
             }.await()
@@ -403,6 +457,10 @@ class MooMooChatRepository(
     }
 
     suspend fun deleteMessage(conversationId: String, messageId: String) {
+        guestStore?.let {
+            it.deleteMessage(conversationId, messageId)
+            return
+        }
         val uid = requireUserId()
         val msgRef = messagesCollection(uid, conversationId).document(messageId)
         try {
@@ -415,8 +473,10 @@ class MooMooChatRepository(
         }
     }
 
-    private suspend fun getMessagesOnce(userId: String, conversationId: String): List<ChatMessageRecord> {
-        val colRef = messagesCollection(userId, conversationId)
+    private suspend fun getMessagesOnce(conversationId: String): List<ChatMessageRecord> {
+        guestStore?.let { return it.getMessagesOnce(conversationId) }
+        val uid = requireUserId()
+        val colRef = messagesCollection(uid, conversationId)
         return try {
             colRef.orderBy("createdAt", Query.Direction.ASCENDING)
                 .get()
@@ -633,8 +693,7 @@ class MooMooChatRepository(
         customInstruction: String,
         onChunk: (String) -> Unit
     ): String {
-        val uid = requireUserId()
-        val allMessages = getMessagesOnce(uid, conversationId)
+        val allMessages = getMessagesOnce(conversationId)
             .filter { !it.isError }
 
         val lastUserIndex = allMessages.indexOfLast { it.role == "user" }
@@ -735,7 +794,6 @@ class MooMooChatRepository(
         conversationId: String,
         firstUserMessage: String
     ) {
-        val uid = requireUserId()
         val fallback = firstUserMessage
             .lineSequence()
             .firstOrNull()
@@ -762,6 +820,12 @@ class MooMooChatRepository(
             fallback
         }
 
+        guestStore?.let {
+            it.updateConversationTitle(conversationId, title)
+            return
+        }
+
+        val uid = requireUserId()
         val docRef = conversationsCollection(uid).document(conversationId)
         try {
             docRef.update(
