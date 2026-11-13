@@ -99,7 +99,18 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -s "app/google-services.json" ] && [ -n "${GOOGLE_SERVICES_JSON_SECRET:-}" ]; then
-            printf '%s\n' "$GOOGLE_SERVICES_JSON_SECRET" > app/google-services.json
+            python3 - <<'PY'
+          import base64, json, os, sys
+          raw = os.environ.get("GOOGLE_SERVICES_JSON_SECRET", "").strip()
+          if not raw:
+              sys.exit(0)
+          content = raw
+          if not raw.startswith("{"):
+              content = base64.b64decode(raw).decode("utf-8")
+          json.loads(content)
+          with open("app/google-services.json", "w", encoding="utf-8") as f:
+              f.write(content)
+          PY
             echo "Restored app/google-services.json from GOOGLE_SERVICES_JSON secret."
           fi
 
@@ -108,7 +119,31 @@ jobs:
             exit 1
           fi
 
-          echo "Verified app/google-services.json is present ($(wc -c < app/google-services.json) bytes)."
+          python3 - <<'PY'
+          import json, re, sys
+          with open("app/google-services.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          project_info = data.get("project_info") or {}
+          clients = data.get("client") or []
+          if not project_info.get("project_id") or not clients:
+              sys.exit("Missing project_id or client entries in app/google-services.json")
+          with open("app/build.gradle.kts", "r", encoding="utf-8") as gf:
+              gradle_text = gf.read()
+          m = re.search(r'applicationId\s*=\s*"([^"]+)"', gradle_text)
+          app_id = m.group(1) if m else None
+          matched = False
+          for client in clients:
+              ci = client.get("client_info") or {}
+              pkg = (ci.get("android_client_info") or {}).get("package_name")
+              has_app_id = bool(ci.get("mobilesdk_app_id"))
+              has_api_key = any(k.get("current_key") for k in (client.get("api_key") or []))
+              if (app_id is None or pkg == app_id) and has_app_id and has_api_key:
+                  matched = True
+                  break
+          if not matched:
+              sys.exit(f"No valid client entry in app/google-services.json matches applicationId={app_id}")
+          print("Validated app/google-services.json structure and package match without exposing values.")
+          PY
 
       - name: Build debug APK
         shell: bash
@@ -139,12 +174,19 @@ jobs:
           fi
 
           GENERATED_FIREBASE_RES="app/build/generated/res/processDebugGoogleServices/values/values.xml"
-          if [ ! -f "$GENERATED_FIREBASE_RES" ] || ! grep -q 'name="google_app_id"' "$GENERATED_FIREBASE_RES"; then
-            echo "::error::Firebase resources (google_app_id) were not packaged from app/google-services.json into the debug APK."
+          if [ ! -f "$GENERATED_FIREBASE_RES" ]; then
+            echo "::error::Generated Google Services resources missing at $GENERATED_FIREBASE_RES"
             exit 1
           fi
 
-          echo "Verified debug APK: $APK_PATH ($(wc -c < "$APK_PATH") bytes) with Firebase configuration packaged."
+          for key in google_app_id google_api_key project_id gcm_defaultSenderId google_storage_bucket; do
+            if ! grep -q "name=\"${key}\"" "$GENERATED_FIREBASE_RES"; then
+              echo "::error::Missing Firebase resource '${key}' from app/google-services.json in debug APK build."
+              exit 1
+            fi
+          done
+
+          echo "Verified debug APK: $APK_PATH ($(wc -c < "$APK_PATH") bytes) with all Firebase google-services.json resources packaged."
 
       - name: Upload debug APK artifact
         id: upload_artifact

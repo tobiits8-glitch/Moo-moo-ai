@@ -6,24 +6,28 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.example.data.local.ConversationEntity
-import com.example.data.local.MooMooDatabase
+import com.example.R
 import com.example.data.preferences.UserPreferences
 import com.example.data.preferences.UserPreferencesRepository
+import com.example.data.remote.unwrapFirestoreException
 import com.example.data.repository.MooMooChatRepository
 import com.example.model.ChatMessage
 import com.example.model.ChatSender
+import com.example.model.ConversationRecord
 import com.example.model.MooMooModelTier
 import com.example.model.MooMooMood
 import com.example.model.toChatMessage
 import com.example.ui.theme.ThemeMode
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -43,7 +47,11 @@ sealed interface GenerationUiState {
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModel(
     private val chatRepository: MooMooChatRepository,
-    private val preferencesRepository: UserPreferencesRepository
+    private val preferencesRepository: UserPreferencesRepository,
+    private val currentUserId: String,
+    val userDisplayName: String,
+    val userEmail: String,
+    private val userPhotoUrl: String?
 ) : ViewModel() {
 
     private val _activeConversationId = MutableStateFlow<String?>(null)
@@ -61,18 +69,58 @@ class ChatViewModel(
     private val _generationState = MutableStateFlow<GenerationUiState>(GenerationUiState.Idle)
     val generationState: StateFlow<GenerationUiState> = _generationState.asStateFlow()
 
+    private val _cloudError = MutableStateFlow<String?>(null)
+    val cloudError: StateFlow<String?> = _cloudError.asStateFlow()
+
     private var activeGenerationJob: Job? = null
+    private var customInstructionSyncJob: Job? = null
 
-    val userPreferences: StateFlow<UserPreferences> = preferencesRepository.preferences
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5_000),
-            initialValue = UserPreferences()
-        )
+    private val remoteUserProfile = chatRepository.observeUserProfile(currentUserId)
+        .catch { error ->
+            val firestoreError = error.unwrapFirestoreException()
+            if (firestoreError == null && error is CancellationException) throw error
+            Log.w(TAG, "Error observing user profile", firestoreError ?: error)
+            emit(null)
+        }
 
-    val conversations: StateFlow<List<ConversationEntity>> =
+    val userPreferences: StateFlow<UserPreferences> = combine(
+        preferencesRepository.preferences,
+        remoteUserProfile
+    ) { localPrefs, profile ->
+        if (profile == null) {
+            localPrefs
+        } else {
+            localPrefs.copy(
+                mood = MooMooMood.fromId(profile.moodId),
+                modelTier = MooMooModelTier.fromId(profile.modelTierId),
+                customInstruction = profile.customInstruction
+            )
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = UserPreferences()
+    )
+
+    private val allConversations: StateFlow<List<ConversationRecord>> =
+        chatRepository.observeConversations(currentUserId)
+            .catch { error ->
+                val firestoreError = error.unwrapFirestoreException()
+                if (firestoreError == null && error is CancellationException) throw error
+                val rootError = firestoreError ?: error
+                Log.w(TAG, "Error observing conversations", rootError)
+                _cloudError.value = rootError.localizedMessage ?: "Failed to sync chat history."
+                emit(emptyList())
+            }
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = emptyList()
+            )
+
+    val conversations: StateFlow<List<ConversationRecord>> =
         combine(
-            chatRepository.observeConversations(),
+            allConversations,
             _searchQuery
         ) { items, query ->
             val trimmed = query.trim()
@@ -84,9 +132,9 @@ class ChatViewModel(
             initialValue = emptyList()
         )
 
-    val activeConversation: StateFlow<ConversationEntity?> =
+    val activeConversation: StateFlow<ConversationRecord?> =
         combine(
-            chatRepository.observeConversations(),
+            allConversations,
             _activeConversationId
         ) { items, activeId ->
             items.firstOrNull { it.id == activeId }
@@ -99,9 +147,19 @@ class ChatViewModel(
     val messages: StateFlow<List<ChatMessage>> =
         _activeConversationId
             .flatMapLatest { id ->
-                if (id == null) flowOf(emptyList())
-                else chatRepository.observeMessages(id).map { entities ->
-                    entities.map { it.toChatMessage() }
+                if (id == null) {
+                    flowOf(emptyList())
+                } else {
+                    chatRepository.observeMessages(currentUserId, id)
+                        .map { records -> records.map { it.toChatMessage() } }
+                        .catch { error ->
+                            val firestoreError = error.unwrapFirestoreException()
+                            if (firestoreError == null && error is CancellationException) throw error
+                            val rootError = firestoreError ?: error
+                            Log.w(TAG, "Error observing messages", rootError)
+                            _cloudError.value = rootError.localizedMessage ?: "Failed to load messages."
+                            emit(emptyList())
+                        }
                 }
             }
             .stateIn(
@@ -109,6 +167,44 @@ class ChatViewModel(
                 started = SharingStarted.WhileSubscribed(5_000),
                 initialValue = emptyList()
             )
+
+    init {
+        viewModelScope.launch {
+            runCatching {
+                val prefs = preferencesRepository.preferences
+                var initial = UserPreferences()
+                prefs.collect { latest ->
+                    initial = latest
+                    throw StopCollectSignal()
+                }
+            }
+        }
+        syncProfileOnLaunch()
+    }
+
+    private fun syncProfileOnLaunch() {
+        viewModelScope.launch {
+            val prefs = userPreferences.value
+            runCatching {
+                chatRepository.syncUserProfile(
+                    displayName = userDisplayName,
+                    email = userEmail,
+                    photoUrl = userPhotoUrl,
+                    defaultMood = prefs.mood,
+                    defaultTier = prefs.modelTier,
+                    defaultCustomInstruction = prefs.customInstruction
+                )
+            }.onFailure { error ->
+                Log.w(TAG, "Unable to sync user profile to Firestore", error)
+            }
+        }
+    }
+
+    private class StopCollectSignal : CancellationException("One-shot collect completed")
+
+    fun dismissCloudError() {
+        _cloudError.value = null
+    }
 
     fun updateComposerText(text: String) {
         _composerText.value = text
@@ -147,15 +243,29 @@ class ChatViewModel(
                 _activeConversationId.value = null
                 _generationState.value = GenerationUiState.Idle
             }
-            chatRepository.deleteConversation(conversationId)
+            runCatching {
+                chatRepository.deleteConversation(conversationId)
+            }.onFailure { error ->
+                _cloudError.value = error.localizedMessage ?: "Unable to delete conversation."
+            }
         }
     }
 
     fun setMood(mood: MooMooMood) {
         viewModelScope.launch {
             preferencesRepository.setMood(mood)
+            val current = userPreferences.value
+            runCatching {
+                chatRepository.updateAssistantPreferences(
+                    mood = mood,
+                    modelTier = current.modelTier,
+                    customInstruction = current.customInstruction
+                )
+            }
             _activeConversationId.value?.let { id ->
-                chatRepository.updateConversationMood(id, mood)
+                runCatching {
+                    chatRepository.updateConversationMood(id, mood)
+                }
             }
         }
     }
@@ -163,12 +273,32 @@ class ChatViewModel(
     fun setModelTier(tier: MooMooModelTier) {
         viewModelScope.launch {
             preferencesRepository.setModelTier(tier)
+            val current = userPreferences.value
+            runCatching {
+                chatRepository.updateAssistantPreferences(
+                    mood = current.mood,
+                    modelTier = tier,
+                    customInstruction = current.customInstruction
+                )
+            }
         }
     }
 
     fun setCustomInstruction(instruction: String) {
         viewModelScope.launch {
             preferencesRepository.setCustomInstruction(instruction)
+        }
+        customInstructionSyncJob?.cancel()
+        customInstructionSyncJob = viewModelScope.launch {
+            delay(450L)
+            val current = userPreferences.value
+            runCatching {
+                chatRepository.updateAssistantPreferences(
+                    mood = current.mood,
+                    modelTier = current.modelTier,
+                    customInstruction = instruction
+                )
+            }
         }
     }
 
@@ -198,22 +328,38 @@ class ChatViewModel(
         activeGenerationJob = viewModelScope.launch {
             val prefs = userPreferences.value
             val isNewConversation = _activeConversationId.value == null
-            val conversationId = _activeConversationId.value ?: run {
-                val initialTitle = rawText.ifBlank { "Photo chat" }.take(36)
-                val created = chatRepository.createConversation(initialTitle, prefs.mood)
-                _activeConversationId.value = created.id
-                created.id
+            val conversationId = try {
+                _activeConversationId.value ?: run {
+                    val initialTitle = rawText.ifBlank { "Photo chat" }.take(36)
+                    val created = chatRepository.createConversation(initialTitle, prefs.mood)
+                    _activeConversationId.value = created.id
+                    created.id
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Error creating conversation in Firestore", e)
+                _cloudError.value = e.localizedMessage ?: "Unable to start chat in Firestore."
+                return@launch
             }
 
             val savedImagePath = imageUri?.let { chatRepository.persistAttachment(it) }
             val userText = rawText.ifBlank { "What's in this image?" }
 
-            chatRepository.saveMessage(
-                conversationId = conversationId,
-                role = "user",
-                text = userText,
-                imagePath = savedImagePath
-            )
+            try {
+                chatRepository.saveMessage(
+                    conversationId = conversationId,
+                    role = "user",
+                    text = userText,
+                    imagePath = savedImagePath
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Error saving message in Firestore", e)
+                _cloudError.value = e.localizedMessage ?: "Unable to save message to Firestore."
+                return@launch
+            }
 
             val succeeded = streamModelResponse(
                 conversationId = conversationId,
@@ -242,7 +388,9 @@ class ChatViewModel(
             val currentMessages = messages.value
             val lastMessage = currentMessages.lastOrNull()
             if (lastMessage != null && (lastMessage.sender == ChatSender.MOO_MOO || lastMessage.isError)) {
-                chatRepository.deleteMessage(lastMessage.id)
+                runCatching {
+                    chatRepository.deleteMessage(conversationId, lastMessage.id)
+                }
             }
             val prefs = userPreferences.value
             streamModelResponse(
@@ -261,11 +409,13 @@ class ChatViewModel(
         val conversationId = _activeConversationId.value
         if (!partial.isNullOrBlank() && conversationId != null) {
             viewModelScope.launch {
-                chatRepository.saveMessage(
-                    conversationId = conversationId,
-                    role = "model",
-                    text = partial
-                )
+                runCatching {
+                    chatRepository.saveMessage(
+                        conversationId = conversationId,
+                        role = "model",
+                        text = partial
+                    )
+                }
             }
         }
         _generationState.value = GenerationUiState.Idle
@@ -305,24 +455,40 @@ class ChatViewModel(
             Log.e(TAG, "Error generating Moo Moo reply", e)
             val msg = e.localizedMessage?.takeIf { it.isNotBlank() }
                 ?: "Moo Moo ran into a snag reaching Gemini. Please try again."
-            chatRepository.saveMessage(
-                conversationId = conversationId,
-                role = "model",
-                text = msg,
-                isError = true
-            )
+            runCatching {
+                chatRepository.saveMessage(
+                    conversationId = conversationId,
+                    role = "model",
+                    text = msg,
+                    isError = true
+                )
+            }
             _generationState.value = GenerationUiState.Error(msg)
             false
         }
     }
 
-    class Factory(private val appContext: Context) : ViewModelProvider.Factory {
+    class Factory(
+        private val appContext: Context,
+        private val currentUserId: String,
+        private val userDisplayName: String,
+        private val userEmail: String,
+        private val userPhotoUrl: String?
+    ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            val db = MooMooDatabase.getInstance(appContext)
-            val repo = MooMooChatRepository(appContext, db.chatDao())
+            val databaseId = appContext.getString(R.string.firestore_database_id)
+            val db = FirebaseFirestore.getInstance(databaseId)
+            val repo = MooMooChatRepository(appContext, db)
             val prefs = UserPreferencesRepository(appContext)
-            return ChatViewModel(repo, prefs) as T
+            return ChatViewModel(
+                chatRepository = repo,
+                preferencesRepository = prefs,
+                currentUserId = currentUserId,
+                userDisplayName = userDisplayName,
+                userEmail = userEmail,
+                userPhotoUrl = userPhotoUrl
+            ) as T
         }
     }
 }

@@ -153,6 +153,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
+    onSignOut: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val conversations by viewModel.conversations.collectAsStateWithLifecycle()
@@ -164,11 +165,20 @@ fun ChatScreen(
     val generationState by viewModel.generationState.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val prefs by viewModel.userPreferences.collectAsStateWithLifecycle()
+    val cloudError by viewModel.cloudError.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     var showCustomizeSheet by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(cloudError) {
+        val message = cloudError
+        if (!message.isNullOrBlank()) {
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+            viewModel.dismissCloudError()
+        }
+    }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
@@ -190,6 +200,8 @@ fun ChatScreen(
                 conversations = conversations,
                 activeConversationId = activeConversationId,
                 searchQuery = searchQuery,
+                userDisplayName = viewModel.userDisplayName,
+                userEmail = viewModel.userEmail,
                 onSearchQueryChange = viewModel::updateSearchQuery,
                 onNewChat = {
                     viewModel.startNewChat()
@@ -203,6 +215,10 @@ fun ChatScreen(
                 onOpenCustomize = {
                     if (!isExpandedWidth) scope.launch { drawerState.close() }
                     showCustomizeSheet = true
+                },
+                onSignOut = {
+                    if (!isExpandedWidth) scope.launch { drawerState.close() }
+                    onSignOut()
                 }
             )
         }

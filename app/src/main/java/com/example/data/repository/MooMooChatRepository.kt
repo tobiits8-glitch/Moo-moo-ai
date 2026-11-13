@@ -9,13 +9,16 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.util.Log
+import com.example.R
 import com.example.ai.configureAppCheck
 import com.example.ai.ensureFirebaseInitialized
-import com.example.data.local.ChatDao
-import com.example.data.local.ConversationEntity
-import com.example.data.local.MessageEntity
+import com.example.data.remote.OperationType
+import com.example.data.remote.handleFirestoreError
+import com.example.model.ChatMessageRecord
+import com.example.model.ConversationRecord
 import com.example.model.MooMooModelTier
 import com.example.model.MooMooMood
+import com.example.model.UserProfile
 import com.google.firebase.Firebase
 import com.google.firebase.FirebaseApp
 import com.google.firebase.ai.FirebaseAI
@@ -25,6 +28,14 @@ import com.google.firebase.ai.type.Content
 import com.google.firebase.ai.type.content
 import com.google.firebase.ai.type.generationConfig
 import com.google.firebase.appcheck.FirebaseAppCheck
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.auth
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FieldValue
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
+import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.snapshots
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
@@ -34,8 +45,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.timeout
+import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.time.Duration.Companion.milliseconds
@@ -48,9 +62,18 @@ private const val UNARY_TIMEOUT_MS = 20_000L
 private const val MAX_IMAGE_DIM = 1280
 
 class MooMooChatRepository(
-    private val context: Context,
-    private val chatDao: ChatDao
+    private val appContext: Context,
+    private val db: FirebaseFirestore,
+    private val auth: FirebaseAuth = Firebase.auth
 ) {
+    constructor(context: Context) : this(
+        appContext = context.applicationContext ?: context,
+        db = FirebaseFirestore.getInstance(
+            (context.applicationContext ?: context).getString(R.string.firestore_database_id)
+        ),
+        auth = Firebase.auth
+    )
+
     private val firebaseAi: FirebaseAI by lazy {
         ensureFirebaseReadyOrThrow()
         Firebase.ai
@@ -67,8 +90,20 @@ class MooMooChatRepository(
         )
     }
 
+    private fun requireUserId(): String {
+        return auth.currentUser?.uid
+            ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
+    }
+
+    private fun userDocRef(userId: String) = db.collection("users").document(userId)
+
+    private fun conversationsCollection(userId: String) =
+        userDocRef(userId).collection("conversations")
+
+    private fun messagesCollection(userId: String, conversationId: String) =
+        conversationsCollection(userId).document(conversationId).collection("messages")
+
     private fun ensureFirebaseReadyOrThrow() {
-        val appContext = context.applicationContext ?: context
         if (FirebaseApp.getApps(appContext).isEmpty()) {
             configureAppCheck(appContext, null)
         }
@@ -81,11 +116,321 @@ class MooMooChatRepository(
     }
 
     private fun isNetworkAvailable(): Boolean {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             ?: return true
         val activeNetwork = cm.activeNetwork ?: return false
         val capabilities = cm.getNetworkCapabilities(activeNetwork) ?: return false
         return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    fun observeUserProfile(userId: String): Flow<UserProfile?> {
+        val docRef = userDocRef(userId)
+        return docRef.snapshots()
+            .map { snapshot ->
+                if (snapshot.exists()) {
+                    snapshot.toObject(
+                        UserProfile::class.java,
+                        DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                    )
+                } else {
+                    null
+                }
+            }
+            .catch { error ->
+                val firestoreError = generateSequence(error) { it.cause }
+                    .filterIsInstance<FirebaseFirestoreException>()
+                    .firstOrNull()
+                if (firestoreError == null && error is CancellationException) throw error
+                val exceptionToLog = firestoreError ?: (error as? Exception)
+                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                    handleFirestoreError(exceptionToLog, OperationType.GET, docRef.path)
+                }
+                throw error
+            }
+    }
+
+    suspend fun syncUserProfile(
+        displayName: String,
+        email: String,
+        photoUrl: String?,
+        defaultMood: MooMooMood,
+        defaultTier: MooMooModelTier,
+        defaultCustomInstruction: String
+    ) {
+        val uid = requireUserId()
+        val docRef = userDocRef(uid)
+        try {
+            val existing = docRef.get().await()
+            val safeName = displayName.trim().take(120)
+            val safeEmail = email.trim().take(254)
+            val safePhoto = photoUrl?.trim()?.takeIf { it.isNotEmpty() }?.take(500)
+
+            if (!existing.exists()) {
+                val payload = mapOf(
+                    "userId" to uid,
+                    "displayName" to safeName,
+                    "email" to safeEmail,
+                    "photoUrl" to safePhoto,
+                    "moodId" to defaultMood.id,
+                    "modelTierId" to defaultTier.id,
+                    "customInstruction" to defaultCustomInstruction.trim().take(2000),
+                    "createdAt" to FieldValue.serverTimestamp(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                ).filterValues { it != null }
+                docRef.set(payload).await()
+            } else {
+                val updates = mapOf(
+                    "displayName" to safeName,
+                    "email" to safeEmail,
+                    "photoUrl" to safePhoto,
+                    "updatedAt" to FieldValue.serverTimestamp()
+                ).filterValues { it != null }
+                docRef.update(updates).await()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, docRef.path)
+            throw e
+        }
+    }
+
+    suspend fun updateAssistantPreferences(
+        mood: MooMooMood,
+        modelTier: MooMooModelTier,
+        customInstruction: String
+    ) {
+        val uid = requireUserId()
+        val docRef = userDocRef(uid)
+        val updates = mapOf(
+            "moodId" to mood.id,
+            "modelTierId" to modelTier.id,
+            "customInstruction" to customInstruction.trim().take(2000),
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+        try {
+            docRef.update(updates).await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+            throw e
+        }
+    }
+
+    fun observeConversations(userId: String): Flow<List<ConversationRecord>> {
+        val colRef = conversationsCollection(userId)
+        return colRef
+            .orderBy("updatedAt", Query.Direction.DESCENDING)
+            .snapshots()
+            .map { snapshot ->
+                snapshot.toObjects(
+                    ConversationRecord::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                )
+            }
+            .catch { error ->
+                val firestoreError = generateSequence(error) { it.cause }
+                    .filterIsInstance<FirebaseFirestoreException>()
+                    .firstOrNull()
+                if (firestoreError == null && error is CancellationException) throw error
+                val exceptionToLog = firestoreError ?: (error as? Exception)
+                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                    handleFirestoreError(exceptionToLog, OperationType.LIST, colRef.path)
+                }
+                throw error
+            }
+    }
+
+    fun observeMessages(userId: String, conversationId: String): Flow<List<ChatMessageRecord>> {
+        val colRef = messagesCollection(userId, conversationId)
+        return colRef
+            .orderBy("createdAt", Query.Direction.ASCENDING)
+            .snapshots()
+            .map { snapshot ->
+                snapshot.toObjects(
+                    ChatMessageRecord::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                )
+            }
+            .catch { error ->
+                val firestoreError = generateSequence(error) { it.cause }
+                    .filterIsInstance<FirebaseFirestoreException>()
+                    .firstOrNull()
+                if (firestoreError == null && error is CancellationException) throw error
+                val exceptionToLog = firestoreError ?: (error as? Exception)
+                if (exceptionToLog != null && auth.currentUser?.uid == userId) {
+                    handleFirestoreError(exceptionToLog, OperationType.LIST, colRef.path)
+                }
+                throw error
+            }
+    }
+
+    suspend fun getConversation(userId: String, conversationId: String): ConversationRecord? {
+        val docRef = conversationsCollection(userId).document(conversationId)
+        return try {
+            docRef.get().await().toObject(
+                ConversationRecord::class.java,
+                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.GET, docRef.path)
+            throw e
+        }
+    }
+
+    suspend fun createConversation(title: String, mood: MooMooMood): ConversationRecord {
+        val uid = requireUserId()
+        val convId = UUID.randomUUID().toString()
+        val safeTitle = title.trim().ifBlank { "New Chat" }.take(120)
+        val docRef = conversationsCollection(uid).document(convId)
+        val payload = mapOf(
+            "userId" to uid,
+            "title" to safeTitle,
+            "moodId" to mood.id,
+            "createdAt" to FieldValue.serverTimestamp(),
+            "updatedAt" to FieldValue.serverTimestamp()
+        )
+        try {
+            docRef.set(payload).await()
+            return ConversationRecord(
+                id = convId,
+                userId = uid,
+                title = safeTitle,
+                moodId = mood.id
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.CREATE, docRef.path)
+            throw e
+        }
+    }
+
+    suspend fun updateConversationMood(conversationId: String, mood: MooMooMood) {
+        val uid = requireUserId()
+        val docRef = conversationsCollection(uid).document(conversationId)
+        try {
+            docRef.update(
+                mapOf(
+                    "moodId" to mood.id,
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+            throw e
+        }
+    }
+
+    suspend fun deleteConversation(conversationId: String) {
+        val uid = requireUserId()
+        val convRef = conversationsCollection(uid).document(conversationId)
+        val msgsCol = messagesCollection(uid, conversationId)
+        try {
+            val msgSnapshots = msgsCol.get().await()
+            val messages = msgSnapshots.toObjects(
+                ChatMessageRecord::class.java,
+                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+            )
+            withContext(Dispatchers.IO) {
+                messages.mapNotNull { it.imagePath }.forEach { path ->
+                    runCatching { File(path).delete() }
+                }
+            }
+            val msgRefs = msgSnapshots.documents.map { it.reference }
+            msgRefs.chunked(400).forEach { chunk ->
+                db.runBatch { batch ->
+                    chunk.forEach { batch.delete(it) }
+                }.await()
+            }
+            convRef.delete().await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, convRef.path)
+            throw e
+        }
+    }
+
+    suspend fun saveMessage(
+        conversationId: String,
+        role: String,
+        text: String,
+        imagePath: String? = null,
+        isError: Boolean = false
+    ): ChatMessageRecord {
+        val uid = requireUserId()
+        val msgId = UUID.randomUUID().toString()
+        val convRef = conversationsCollection(uid).document(conversationId)
+        val msgRef = messagesCollection(uid, conversationId).document(msgId)
+        val safeText = text.take(64_000)
+        val safeImagePath = imagePath?.takeIf { it.isNotBlank() }?.take(500)
+        val payload = mapOf(
+            "userId" to uid,
+            "conversationId" to conversationId,
+            "role" to role,
+            "text" to safeText,
+            "imagePath" to safeImagePath,
+            "isError" to isError,
+            "createdAt" to FieldValue.serverTimestamp()
+        ).filterValues { it != null }
+
+        try {
+            db.runBatch { batch ->
+                batch.set(msgRef, payload)
+                batch.update(convRef, mapOf("updatedAt" to FieldValue.serverTimestamp()))
+            }.await()
+            return ChatMessageRecord(
+                id = msgId,
+                userId = uid,
+                conversationId = conversationId,
+                role = role,
+                text = safeText,
+                imagePath = safeImagePath,
+                isError = isError
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.CREATE, msgRef.path)
+            throw e
+        }
+    }
+
+    suspend fun deleteMessage(conversationId: String, messageId: String) {
+        val uid = requireUserId()
+        val msgRef = messagesCollection(uid, conversationId).document(messageId)
+        try {
+            msgRef.delete().await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, msgRef.path)
+            throw e
+        }
+    }
+
+    private suspend fun getMessagesOnce(userId: String, conversationId: String): List<ChatMessageRecord> {
+        val colRef = messagesCollection(userId, conversationId)
+        return try {
+            colRef.orderBy("createdAt", Query.Direction.ASCENDING)
+                .get()
+                .await()
+                .toObjects(
+                    ChatMessageRecord::class.java,
+                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+                )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.LIST, colRef.path)
+            throw e
+        }
     }
 
     private fun buildSystemInstruction(mood: MooMooMood, customInstruction: String): Content {
@@ -117,73 +462,11 @@ class MooMooChatRepository(
         }
     }
 
-    fun observeConversations(): Flow<List<ConversationEntity>> =
-        chatDao.observeConversations()
-
-    fun observeMessages(conversationId: String): Flow<List<MessageEntity>> =
-        chatDao.observeMessages(conversationId)
-
-    suspend fun getConversation(conversationId: String): ConversationEntity? =
-        chatDao.getConversation(conversationId)
-
-    suspend fun createConversation(title: String, mood: MooMooMood): ConversationEntity {
-        val now = System.currentTimeMillis()
-        val entity = ConversationEntity(
-            id = UUID.randomUUID().toString(),
-            title = title,
-            moodId = mood.id,
-            createdAt = now,
-            updatedAt = now
-        )
-        chatDao.upsertConversation(entity)
-        return entity
-    }
-
-    suspend fun updateConversationMood(conversationId: String, mood: MooMooMood) {
-        chatDao.updateConversationMood(conversationId, mood.id, System.currentTimeMillis())
-    }
-
-    suspend fun deleteConversation(conversationId: String) {
-        val messages = chatDao.getMessagesOnce(conversationId)
-        withContext(Dispatchers.IO) {
-            messages.mapNotNull { it.imagePath }.forEach { path ->
-                runCatching { File(path).delete() }
-            }
-        }
-        chatDao.deleteConversation(conversationId)
-    }
-
-    suspend fun saveMessage(
-        conversationId: String,
-        role: String,
-        text: String,
-        imagePath: String? = null,
-        isError: Boolean = false
-    ): MessageEntity {
-        val now = System.currentTimeMillis()
-        val message = MessageEntity(
-            id = UUID.randomUUID().toString(),
-            conversationId = conversationId,
-            role = role,
-            text = text,
-            imagePath = imagePath,
-            isError = isError,
-            timestamp = now
-        )
-        chatDao.insertMessage(message)
-        chatDao.touchConversation(conversationId, now)
-        return message
-    }
-
-    suspend fun deleteMessage(messageId: String) {
-        chatDao.deleteMessage(messageId)
-    }
-
     suspend fun persistAttachment(uri: Uri): String? = withContext(Dispatchers.IO) {
         runCatching {
-            val attachmentsDir = File(context.filesDir, "attachments").apply { mkdirs() }
+            val attachmentsDir = File(appContext.filesDir, "attachments").apply { mkdirs() }
             val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            context.contentResolver.openInputStream(uri)?.use { stream ->
+            appContext.contentResolver.openInputStream(uri)?.use { stream ->
                 BitmapFactory.decodeStream(stream, null, boundsOptions)
             }
 
@@ -193,7 +476,7 @@ class MooMooChatRepository(
                 maxDim = MAX_IMAGE_DIM
             )
             val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            val originalBitmap = context.contentResolver.openInputStream(uri)?.use { stream ->
+            val originalBitmap = appContext.contentResolver.openInputStream(uri)?.use { stream ->
                 BitmapFactory.decodeStream(stream, null, decodeOptions)
             } ?: return@withContext null
 
@@ -232,7 +515,7 @@ class MooMooChatRepository(
 
     private fun rotateBitmapIfNeeded(uri: Uri, bitmap: Bitmap): Bitmap {
         val orientation = runCatching {
-            context.contentResolver.openInputStream(uri)?.use { stream ->
+            appContext.contentResolver.openInputStream(uri)?.use { stream ->
                 ExifInterface(stream).getAttributeInt(
                     ExifInterface.TAG_ORIENTATION,
                     ExifInterface.ORIENTATION_NORMAL
@@ -262,6 +545,8 @@ class MooMooChatRepository(
     }
 
     private suspend fun loadBitmap(path: String): Bitmap? = withContext(Dispatchers.IO) {
+        val file = File(path)
+        if (!file.exists()) return@withContext null
         runCatching {
             BitmapFactory.decodeFile(path)
         }.onFailure { e ->
@@ -269,8 +554,8 @@ class MooMooChatRepository(
         }.getOrNull()
     }
 
-    private fun sanitizePriorHistory(priorMessages: List<MessageEntity>): List<MessageEntity> {
-        val alternating = mutableListOf<MessageEntity>()
+    private fun sanitizePriorHistory(priorMessages: List<ChatMessageRecord>): List<ChatMessageRecord> {
+        val alternating = mutableListOf<ChatMessageRecord>()
         var expectedRole = "user"
         for (msg in priorMessages.takeLast(20)) {
             if (msg.role == expectedRole) {
@@ -348,7 +633,8 @@ class MooMooChatRepository(
         customInstruction: String,
         onChunk: (String) -> Unit
     ): String {
-        val allMessages = chatDao.getMessagesOnce(conversationId)
+        val uid = requireUserId()
+        val allMessages = getMessagesOnce(uid, conversationId)
             .filter { !it.isError }
 
         val lastUserIndex = allMessages.indexOfLast { it.role == "user" }
@@ -398,7 +684,6 @@ class MooMooChatRepository(
         Log.d(TAG, "Starting Moo Moo reply via ${modelTier.modelName} (history=${historyContents.size})")
 
         try {
-            // 1. Primary streaming attempt
             val primaryStream = tryStream(
                 model = primaryModel,
                 historyContents = historyContents,
@@ -408,7 +693,6 @@ class MooMooChatRepository(
             )
             if (primaryStream != null) return primaryStream
 
-            // 2. If SMART streaming timed out, try FAST model streaming
             val allTurnContents = historyContents + userPromptContent
             if (modelTier != MooMooModelTier.FAST) {
                 val fastModel = getOrCreateModel(MooMooModelTier.FAST, mood, customInstruction)
@@ -423,7 +707,6 @@ class MooMooChatRepository(
                 if (fastStream != null) return fastStream
             }
 
-            // 3. Unary non-streaming fallback (in case SSE stream buffering stalled)
             val fallbackModel = getOrCreateModel(MooMooModelTier.FAST, mood, customInstruction)
             Log.w(TAG, "Falling back to unary generateContent")
             val unaryText = try {
@@ -452,6 +735,7 @@ class MooMooChatRepository(
         conversationId: String,
         firstUserMessage: String
     ) {
+        val uid = requireUserId()
         val fallback = firstUserMessage
             .lineSequence()
             .firstOrNull()
@@ -478,6 +762,18 @@ class MooMooChatRepository(
             fallback
         }
 
-        chatDao.updateConversationTitle(conversationId, title, System.currentTimeMillis())
+        val docRef = conversationsCollection(uid).document(conversationId)
+        try {
+            docRef.update(
+                mapOf(
+                    "title" to title.take(120),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+        }
     }
 }

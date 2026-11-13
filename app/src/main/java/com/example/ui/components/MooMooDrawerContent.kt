@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Search
@@ -44,6 +45,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -59,18 +61,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
-import com.example.data.local.ConversationEntity
+import com.example.model.ConversationRecord
 
 @Composable
 fun MooMooDrawerContent(
-    conversations: List<ConversationEntity>,
+    conversations: List<ConversationRecord>,
     activeConversationId: String?,
     searchQuery: String,
+    userDisplayName: String,
+    userEmail: String,
     onSearchQueryChange: (String) -> Unit,
     onNewChat: () -> Unit,
     onSelectConversation: (String) -> Unit,
     onDeleteConversation: (String) -> Unit,
     onOpenCustomize: () -> Unit,
+    onSignOut: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     ModalDrawerSheet(
@@ -259,13 +264,61 @@ fun MooMooDrawerContent(
                     style = MaterialTheme.typography.labelLarge
                 )
             }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    if (userDisplayName.isNotBlank()) {
+                        Text(
+                            text = userDisplayName,
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (userEmail.isNotBlank()) {
+                        Text(
+                            text = userEmail,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                TextButton(
+                    onClick = onSignOut,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("sign_out_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Outlined.Logout,
+                        contentDescription = stringResource(R.string.cd_sign_out),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = stringResource(R.string.drawer_sign_out),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
 private fun ConversationDrawerRow(
-    conversation: ConversationEntity,
+    conversation: ConversationRecord,
     isSelected: Boolean,
     onSelect: () -> Unit,
     onDelete: () -> Unit,
@@ -289,9 +342,10 @@ private fun ConversationDrawerRow(
         animationSpec = tween(durationMillis = 180),
         label = "drawer_row_content"
     )
-    val relativeTime = remember(conversation.updatedAt) {
+    val updatedAtMs = conversation.updatedAtMillis
+    val relativeTime = remember(updatedAtMs) {
         DateUtils.getRelativeTimeSpanString(
-            conversation.updatedAt,
+            updatedAtMs,
             System.currentTimeMillis(),
             DateUtils.MINUTE_IN_MILLIS
         ).toString()

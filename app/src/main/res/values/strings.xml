@@ -39,4 +39,17 @@
     <string name="copied_toast">Copied to clipboard</string>
     <string name="moomoo_thinking">Moo Moo is thinking…</string>
     <string name="error_retry">Try again</string>
+    <string name="auth_welcome_title">Meet Moo Moo AI</string>
+    <string name="auth_welcome_subtitle">Sign in with Google to chat with Gemini and keep your conversations backed up in the cloud.</string>
+    <string name="auth_feature_ai_title">Smart Gemini Answers</string>
+    <string name="auth_feature_ai_desc">Streaming replies, markdown formatting, code blocks, and photo Q&amp;A.</string>
+    <string name="auth_feature_sync_title">Cloud Chat History</string>
+    <string name="auth_feature_sync_desc">Your threads, custom instructions, and modes stay synced via Firestore.</string>
+    <string name="auth_feature_private_title">Private to Your Account</string>
+    <string name="auth_feature_private_desc">Protected by Google Sign-In and per-user security rules.</string>
+    <string name="auth_sign_in_google">Sign in with Google</string>
+    <string name="auth_signing_in">Signing in…</string>
+    <string name="auth_checking_session">Checking session…</string>
+    <string name="drawer_sign_out">Sign Out</string>
+    <string name="cd_sign_out">Sign out of Google account</string>
 </resources>

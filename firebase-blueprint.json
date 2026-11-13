@@ -1,0 +1,163 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile and synced Moo Moo assistant preferences.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name from Google Sign-In."
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address from Google Sign-In."
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Optional profile photo URL."
+        },
+        "moodId": {
+          "type": "string",
+          "enum": ["classic", "brainstorm", "study", "coding", "custom"],
+          "description": "Selected Moo Moo assistant mode."
+        },
+        "modelTierId": {
+          "type": "string",
+          "enum": ["smart", "fast"],
+          "description": "Selected Gemini model tier."
+        },
+        "customInstruction": {
+          "type": "string",
+          "description": "User custom system instruction for Moo Moo."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (clients must submit FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (clients must submit FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "displayName",
+        "email",
+        "moodId",
+        "modelTierId",
+        "customInstruction",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "A user-owned Moo Moo AI chat conversation thread.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the conversation owner."
+        },
+        "title": {
+          "type": "string",
+          "description": "Display title of the conversation."
+        },
+        "moodId": {
+          "type": "string",
+          "enum": ["classic", "brainstorm", "study", "coding", "custom"],
+          "description": "Assistant mode used for this conversation."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (clients must submit FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when last updated (clients must submit FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "moodId",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatMessageRecord": {
+      "title": "ChatMessageRecord",
+      "description": "An individual message in a user-owned conversation.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the message owner."
+        },
+        "conversationId": {
+          "type": "string",
+          "description": "Parent conversation document ID."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "model"],
+          "description": "Sender role ('user' or 'model')."
+        },
+        "text": {
+          "type": "string",
+          "description": "Message body text."
+        },
+        "imagePath": {
+          "type": "string",
+          "description": "Optional local attachment file path."
+        },
+        "isError": {
+          "type": "boolean",
+          "description": "Whether this message represents an error notice."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when created (clients must submit FieldValue.serverTimestamp())."
+        }
+      },
+      "required": [
+        "userId",
+        "conversationId",
+        "role",
+        "text",
+        "isError",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserProfile"
+      },
+      "description": "Authenticated user profile and synced Moo Moo preferences."
+    },
+    "/users/{userId}/conversations/{conversationId}": {
+      "schema": {
+        "$ref": "#/entities/Conversation"
+      },
+      "description": "Chat conversations belonging to the authenticated user."
+    },
+    "/users/{userId}/conversations/{conversationId}/messages/{messageId}": {
+      "schema": {
+        "$ref": "#/entities/ChatMessageRecord"
+      },
+      "description": "Ordered chat messages belonging to a user's conversation."
+    }
+  }
+}

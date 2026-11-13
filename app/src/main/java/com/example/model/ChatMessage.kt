@@ -1,7 +1,5 @@
 package com.example.model
 
-import com.example.data.local.MessageEntity
-
 enum class ChatSender {
     USER,
     MOO_MOO
@@ -19,11 +17,11 @@ data class ChatMessage(
         get() = sender == ChatSender.USER
 }
 
-fun MessageEntity.toChatMessage(): ChatMessage = ChatMessage(
+fun ChatMessageRecord.toChatMessage(): ChatMessage = ChatMessage(
     id = id,
     sender = if (role == "user") ChatSender.USER else ChatSender.MOO_MOO,
     text = text,
     imagePath = imagePath,
     isError = isError,
-    timestamp = timestamp
+    timestamp = createdAt?.toDate()?.time ?: System.currentTimeMillis()
 )
