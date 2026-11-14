@@ -155,6 +155,8 @@ fun configureAppCheck(context: Context, intent: Intent?) {
                     installedDebugSecret = effectiveSecret
                     if (secretChanged || modeChanged) {
                         appCheck.getAppCheckToken(true)
+                    } else if (!isRobolectric) {
+                        appCheck.getAppCheckToken(false)
                     }
                     Log.d(TAG, "DebugAppCheckProviderFactory installed.")
                 }
@@ -178,6 +180,9 @@ fun configureAppCheck(context: Context, intent: Intent?) {
                     )
                     installedMode = AppCheckProviderMode.RECAPTCHA
                     installedDebugSecret = null
+                    if (!isRobolectric) {
+                        appCheck.getAppCheckToken(false)
+                    }
                     Log.d(TAG, "RecaptchaAppCheckProviderFactory installed.")
                 }
             }

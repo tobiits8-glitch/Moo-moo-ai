@@ -114,10 +114,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -148,6 +148,7 @@ import com.example.ui.components.moodIcon
 import com.example.ui.theme.MooMooTheme
 import java.io.File
 import java.util.Locale
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 @Composable
@@ -160,8 +161,6 @@ fun ChatScreen(
     val activeConversationId by viewModel.activeConversationId.collectAsStateWithLifecycle()
     val activeConversation by viewModel.activeConversation.collectAsStateWithLifecycle()
     val messages by viewModel.messages.collectAsStateWithLifecycle()
-    val composerText by viewModel.composerText.collectAsStateWithLifecycle()
-    val pendingImageUri by viewModel.pendingImageUri.collectAsStateWithLifecycle()
     val generationState by viewModel.generationState.collectAsStateWithLifecycle()
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val prefs by viewModel.userPreferences.collectAsStateWithLifecycle()
@@ -229,8 +228,34 @@ fun ChatScreen(
                 conversationTitle = activeConversation?.title,
                 messages = messages,
                 generationState = generationState,
-                composerText = composerText,
-                pendingImageUri = pendingImageUri,
+                composerSlot = { isGenerating ->
+                    ChatComposerSlot(
+                        composerTextFlow = viewModel.composerText,
+                        pendingImageUriFlow = viewModel.pendingImageUri,
+                        isGenerating = isGenerating,
+                        onTextChange = viewModel::updateComposerText,
+                        onPickImage = {
+                            runCatching {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            }.onFailure {
+                                Toast.makeText(
+                                    context,
+                                    "No photo picker available on this device.",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        },
+                        onClearPendingImage = viewModel::clearPendingImage,
+                        onSend = { viewModel.sendMessage() },
+                        onStop = viewModel::cancelGeneration,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .widthIn(max = 760.dp)
+                            .padding(horizontal = 14.dp, vertical = 10.dp)
+                    )
+                },
                 selectedModelTier = prefs.modelTier,
                 selectedMood = prefs.mood,
                 isExpandedWidth = isExpandedWidth,
@@ -239,24 +264,7 @@ fun ChatScreen(
                 onOpenCustomize = { showCustomizeSheet = true },
                 onSelectModelTier = viewModel::setModelTier,
                 onSelectMood = viewModel::setMood,
-                onComposerTextChange = viewModel::updateComposerText,
-                onPickImage = {
-                    runCatching {
-                        photoPickerLauncher.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
-                    }.onFailure {
-                        Toast.makeText(
-                            context,
-                            "No photo picker available on this device.",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                },
-                onClearPendingImage = viewModel::clearPendingImage,
-                onSendMessage = { viewModel.sendMessage() },
                 onStarterPromptClick = { prompt -> viewModel.sendMessage(prompt) },
-                onStopGeneration = viewModel::cancelGeneration,
                 onRegenerateReply = viewModel::regenerateLastReply
             )
         }
@@ -317,8 +325,22 @@ fun ChatScreen(
         conversationTitle = conversationTitle,
         messages = messages,
         generationState = generationState,
-        composerText = composerText,
-        pendingImageUri = pendingImageUri,
+        composerSlot = { isGenerating ->
+            ChatComposerBar(
+                text = composerText,
+                pendingImageUri = pendingImageUri,
+                isGenerating = isGenerating,
+                onTextChange = onComposerTextChange,
+                onPickImage = onPickImage,
+                onClearPendingImage = onClearPendingImage,
+                onSend = onSendMessage,
+                onStop = onStopGeneration,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 760.dp)
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+            )
+        },
         selectedModelTier = selectedModelTier,
         selectedMood = selectedMood,
         isExpandedWidth = false,
@@ -327,13 +349,35 @@ fun ChatScreen(
         onOpenCustomize = onOpenCustomize,
         onSelectModelTier = onSelectModelTier,
         onSelectMood = onSelectMood,
-        onComposerTextChange = onComposerTextChange,
+        onStarterPromptClick = onStarterPromptClick,
+        onRegenerateReply = onRegenerateReply,
+        modifier = modifier
+    )
+}
+
+@Composable
+private fun ChatComposerSlot(
+    composerTextFlow: StateFlow<String>,
+    pendingImageUriFlow: StateFlow<Uri?>,
+    isGenerating: Boolean,
+    onTextChange: (String) -> Unit,
+    onPickImage: () -> Unit,
+    onClearPendingImage: () -> Unit,
+    onSend: () -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val composerText by composerTextFlow.collectAsStateWithLifecycle()
+    val pendingImageUri by pendingImageUriFlow.collectAsStateWithLifecycle()
+    ChatComposerBar(
+        text = composerText,
+        pendingImageUri = pendingImageUri,
+        isGenerating = isGenerating,
+        onTextChange = onTextChange,
         onPickImage = onPickImage,
         onClearPendingImage = onClearPendingImage,
-        onSendMessage = onSendMessage,
-        onStarterPromptClick = onStarterPromptClick,
-        onStopGeneration = onStopGeneration,
-        onRegenerateReply = onRegenerateReply,
+        onSend = onSend,
+        onStop = onStop,
         modifier = modifier
     )
 }
@@ -344,8 +388,7 @@ private fun ChatMainPane(
     conversationTitle: String?,
     messages: List<ChatMessage>,
     generationState: GenerationUiState,
-    composerText: String,
-    pendingImageUri: Uri?,
+    composerSlot: @Composable (isGenerating: Boolean) -> Unit,
     selectedModelTier: MooMooModelTier,
     selectedMood: MooMooMood,
     isExpandedWidth: Boolean,
@@ -354,12 +397,7 @@ private fun ChatMainPane(
     onOpenCustomize: () -> Unit,
     onSelectModelTier: (MooMooModelTier) -> Unit,
     onSelectMood: (MooMooMood) -> Unit,
-    onComposerTextChange: (String) -> Unit,
-    onPickImage: () -> Unit,
-    onClearPendingImage: () -> Unit,
-    onSendMessage: () -> Unit,
     onStarterPromptClick: (String) -> Unit,
-    onStopGeneration: () -> Unit,
     onRegenerateReply: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -510,7 +548,7 @@ private fun ChatMainPane(
         }
     }
 
-    LaunchedEffect(streamingLength) {
+    LaunchedEffect(streamingLength / 48) {
         if (streamingLength > 0 && isNearBottom) {
             val total = listState.layoutInfo.totalItemsCount
             if (total > 0) {
@@ -519,13 +557,17 @@ private fun ChatMainPane(
         }
     }
 
-    val bgGradient = Brush.verticalGradient(
-        colors = listOf(
-            MaterialTheme.colorScheme.background,
-            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.32f),
-            MaterialTheme.colorScheme.background
+    val bgColor = MaterialTheme.colorScheme.background
+    val surfaceVariantColor = MaterialTheme.colorScheme.surfaceVariant
+    val bgGradient = remember(bgColor, surfaceVariantColor) {
+        Brush.verticalGradient(
+            colors = listOf(
+                bgColor,
+                surfaceVariantColor.copy(alpha = 0.32f),
+                bgColor
+            )
         )
-    )
+    }
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
@@ -735,14 +777,14 @@ private fun ChatMainPane(
                                     message = message,
                                     showRegenerate = isLastMessage && (!message.isFromUser || message.isError),
                                     isSpeaking = isSpeaking,
-                                    onToggleSpeak = { toggleSpeak(message.id, message.text) },
+                                    onToggleSpeak = ::toggleSpeak,
                                     onRegenerate = onRegenerateReply,
                                     modifier = Modifier.animateItem(
-                                        fadeInSpec = tween(durationMillis = 180),
-                                        fadeOutSpec = tween(durationMillis = 140),
+                                        fadeInSpec = tween(durationMillis = 160),
+                                        fadeOutSpec = tween(durationMillis = 130),
                                         placementSpec = spring(
                                             dampingRatio = Spring.DampingRatioNoBouncy,
-                                            stiffness = Spring.StiffnessMediumLow
+                                            stiffness = Spring.StiffnessMedium
                                         )
                                     )
                                 )
@@ -799,20 +841,7 @@ private fun ChatMainPane(
                 }
             }
 
-            ChatComposerBar(
-                text = composerText,
-                pendingImageUri = pendingImageUri,
-                isGenerating = isGenerating,
-                onTextChange = onComposerTextChange,
-                onPickImage = onPickImage,
-                onClearPendingImage = onClearPendingImage,
-                onSend = onSendMessage,
-                onStop = onStopGeneration,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .widthIn(max = 760.dp)
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
-            )
+            composerSlot(isGenerating)
         }
     }
 }
@@ -955,7 +984,7 @@ private fun ChatMessageBubble(
     message: ChatMessage,
     showRegenerate: Boolean,
     isSpeaking: Boolean,
-    onToggleSpeak: () -> Unit,
+    onToggleSpeak: (String, String) -> Unit,
     onRegenerate: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -987,7 +1016,8 @@ private fun ChatMessageBubble(
                         val imageRequest = remember(path, context) {
                             ImageRequest.Builder(context)
                                 .data(File(path))
-                                .crossfade(true)
+                                .size(720)
+                                .crossfade(120)
                                 .build()
                         }
                         AsyncImage(
@@ -1091,7 +1121,7 @@ private fun ChatMessageBubble(
                     }
 
                     IconButton(
-                        onClick = onToggleSpeak,
+                        onClick = { onToggleSpeak(message.id, message.text) },
                         modifier = Modifier.minimumInteractiveComponentSize()
                     ) {
                         Icon(
@@ -1223,7 +1253,7 @@ private fun MooMooThinkingBubble(modifier: Modifier = Modifier) {
                 .clip(CircleShape)
         )
         Row(
-            modifier = Modifier.alpha(pulse),
+            modifier = Modifier.graphicsLayer { alpha = pulse },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -1274,8 +1304,15 @@ private fun ChatComposerBar(
                             .padding(start = 8.dp, top = 6.dp, bottom = 4.dp)
                             .size(84.dp)
                     ) {
+                        val thumbContext = LocalContext.current
+                        val thumbRequest = remember(uri, thumbContext) {
+                            ImageRequest.Builder(thumbContext)
+                                .data(uri)
+                                .size(240)
+                                .build()
+                        }
                         AsyncImage(
-                            model = uri,
+                            model = thumbRequest,
                             contentDescription = stringResource(R.string.cd_attached_image),
                             contentScale = ContentScale.Crop,
                             modifier = Modifier

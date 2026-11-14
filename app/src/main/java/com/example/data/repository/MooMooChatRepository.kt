@@ -3,11 +3,13 @@ package com.example.data.repository
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.util.Log
 import com.example.R
 import com.example.ai.configureAppCheck
@@ -45,6 +47,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flowOf
@@ -149,6 +154,18 @@ class MooMooChatRepository private constructor(
         }
         if (!isAppCheckConfigured()) {
             configureAppCheck(appContext, null)
+        }
+    }
+
+    suspend fun prewarmAiClient(
+        defaultTier: MooMooModelTier,
+        defaultMood: MooMooMood,
+        customInstruction: String
+    ) = withContext(Dispatchers.Default) {
+        runCatching {
+            if (ensureFirebaseInitialized(appContext)) {
+                getOrCreateModel(defaultTier, defaultMood, customInstruction)
+            }
         }
     }
 
@@ -526,28 +543,46 @@ class MooMooChatRepository private constructor(
     suspend fun persistAttachment(uri: Uri): String? = withContext(Dispatchers.IO) {
         runCatching {
             val attachmentsDir = File(appContext.filesDir, "attachments").apply { mkdirs() }
-            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            appContext.contentResolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, boundsOptions)
-            }
+            val scaledBitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val source = ImageDecoder.createSource(appContext.contentResolver, uri)
+                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    val width = info.size.width
+                    val height = info.size.height
+                    val maxSide = maxOf(width, height)
+                    if (maxSide > MAX_IMAGE_DIM && width > 0 && height > 0) {
+                        val ratio = MAX_IMAGE_DIM.toFloat() / maxSide.toFloat()
+                        decoder.setTargetSize(
+                            (width * ratio).toInt().coerceAtLeast(1),
+                            (height * ratio).toInt().coerceAtLeast(1)
+                        )
+                    }
+                }
+            } else {
+                val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                appContext.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream, null, boundsOptions)
+                }
 
-            val sampleSize = computeInSampleSize(
-                width = boundsOptions.outWidth,
-                height = boundsOptions.outHeight,
-                maxDim = MAX_IMAGE_DIM
-            )
-            val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            val originalBitmap = appContext.contentResolver.openInputStream(uri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, decodeOptions)
-            } ?: return@withContext null
+                val sampleSize = computeInSampleSize(
+                    width = boundsOptions.outWidth,
+                    height = boundsOptions.outHeight,
+                    maxDim = MAX_IMAGE_DIM
+                )
+                val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+                val originalBitmap = appContext.contentResolver.openInputStream(uri)?.use { stream ->
+                    BitmapFactory.decodeStream(stream, null, decodeOptions)
+                } ?: return@withContext null
 
-            val orientedBitmap = rotateBitmapIfNeeded(uri, originalBitmap)
-            val scaledBitmap = scaleBitmapDown(orientedBitmap, MAX_IMAGE_DIM)
-            if (scaledBitmap !== orientedBitmap) {
-                orientedBitmap.recycle()
-            }
-            if (orientedBitmap !== originalBitmap && !originalBitmap.isRecycled) {
-                originalBitmap.recycle()
+                val orientedBitmap = rotateBitmapIfNeeded(uri, originalBitmap)
+                val downscaled = scaleBitmapDown(orientedBitmap, MAX_IMAGE_DIM)
+                if (downscaled !== orientedBitmap) {
+                    orientedBitmap.recycle()
+                }
+                if (orientedBitmap !== originalBitmap && !originalBitmap.isRecycled) {
+                    originalBitmap.recycle()
+                }
+                downscaled
             }
 
             val outFile = File(attachmentsDir, "${UUID.randomUUID()}.jpg")
@@ -692,10 +727,14 @@ class MooMooChatRepository private constructor(
         modelTier: MooMooModelTier,
         mood: MooMooMood,
         customInstruction: String,
+        cachedMessages: List<ChatMessageRecord>? = null,
         onChunk: (String) -> Unit
     ): String {
-        val allMessages = getMessagesOnce(conversationId)
-            .filter { !it.isError }
+        val allMessages = (if (!cachedMessages.isNullOrEmpty()) {
+            cachedMessages
+        } else {
+            getMessagesOnce(conversationId)
+        }).filter { !it.isError }
 
         val lastUserIndex = allMessages.indexOfLast { it.role == "user" }
         require(lastUserIndex >= 0) { "No user message found to reply to." }
@@ -703,32 +742,40 @@ class MooMooChatRepository private constructor(
         val priorMessages = sanitizePriorHistory(allMessages.take(lastUserIndex))
         val latestUserMessage = allMessages[lastUserIndex]
 
-        val historyContents = mutableListOf<Content>()
-        for (msg in priorMessages) {
-            val bitmap = msg.imagePath?.let { loadBitmap(it) }
-            val built = content(role = msg.role) {
-                if (bitmap != null) {
-                    image(bitmap)
-                }
-                if (msg.text.isNotBlank()) {
-                    text(msg.text)
-                } else if (bitmap != null) {
-                    text("See attached image.")
-                }
+        val (historyContents, userPromptContent) = coroutineScope {
+            val priorBitmapsDeferred = priorMessages.map { msg ->
+                async(Dispatchers.IO) { msg.imagePath?.let { loadBitmap(it) } }
             }
-            historyContents.add(built)
-        }
+            val latestBitmapDeferred = async(Dispatchers.IO) {
+                latestUserMessage.imagePath?.let { loadBitmap(it) }
+            }
+            val priorBitmaps = priorBitmapsDeferred.awaitAll()
+            val latestBitmap = latestBitmapDeferred.await()
 
-        val latestBitmap = latestUserMessage.imagePath?.let { loadBitmap(it) }
-        val userPromptContent = content(role = "user") {
-            if (latestBitmap != null) {
-                image(latestBitmap)
+            val history = priorMessages.mapIndexed { idx, msg ->
+                val bitmap = priorBitmaps[idx]
+                content(role = msg.role) {
+                    if (bitmap != null) {
+                        image(bitmap)
+                    }
+                    if (msg.text.isNotBlank()) {
+                        text(msg.text)
+                    } else if (bitmap != null) {
+                        text("See attached image.")
+                    }
+                }
             }
-            if (latestUserMessage.text.isNotBlank()) {
-                text(latestUserMessage.text)
-            } else {
-                text("What do you see in this image? Help me out, Moo Moo.")
+            val prompt = content(role = "user") {
+                if (latestBitmap != null) {
+                    image(latestBitmap)
+                }
+                if (latestUserMessage.text.isNotBlank()) {
+                    text(latestUserMessage.text)
+                } else {
+                    text("What do you see in this image? Help me out, Moo Moo.")
+                }
             }
+            history to prompt
         }
 
         if (!isNetworkAvailable()) {

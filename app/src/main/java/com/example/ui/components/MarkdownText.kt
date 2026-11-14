@@ -37,9 +37,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.ui.theme.JetBrainsMonoFontFamily
 
-private val HEADING_REGEX = Regex("^(#{1,3})\\s+(.+)$")
-private val BULLET_REGEX = Regex("^([-*•])\\s+(.+)$")
-private val NUMBERED_REGEX = Regex("^(\\d+\\.)\\s+(.+)$")
+private val INLINE_MARKERS = charArrayOf('*', '`')
 
 private sealed interface MarkdownBlock {
     data class Paragraph(val text: String) : MarkdownBlock
@@ -183,33 +181,41 @@ private fun CodeBlockCard(
 }
 
 private fun parseMarkdownBlocks(input: String): List<MarkdownBlock> {
-    val lines = input.lines()
-    val blocks = mutableListOf<MarkdownBlock>()
+    if (input.isEmpty()) return emptyList()
+    val lines = input.split('\n')
+    val blocks = ArrayList<MarkdownBlock>(lines.size.coerceAtLeast(4))
     var i = 0
     val paragraphBuffer = StringBuilder()
 
     fun flushParagraph() {
-        val text = paragraphBuffer.toString().trim()
-        if (text.isNotEmpty()) {
-            blocks.add(MarkdownBlock.Paragraph(text))
+        if (paragraphBuffer.isNotEmpty()) {
+            val text = paragraphBuffer.toString().trim()
+            if (text.isNotEmpty()) {
+                blocks.add(MarkdownBlock.Paragraph(text))
+            }
+            paragraphBuffer.setLength(0)
         }
-        paragraphBuffer.clear()
     }
 
     while (i < lines.size) {
-        val line = lines[i]
+        val rawLine = lines[i]
+        val line = if (rawLine.endsWith('\r')) rawLine.dropLast(1) else rawLine
         val trimmed = line.trim()
 
         if (trimmed.startsWith("```")) {
             flushParagraph()
             val lang = trimmed.removePrefix("```").trim()
-            val codeLines = mutableListOf<String>()
+            val codeBuffer = StringBuilder()
             i++
-            while (i < lines.size && !lines[i].trim().startsWith("```")) {
-                codeLines.add(lines[i])
+            while (i < lines.size) {
+                val codeRaw = lines[i]
+                val codeLine = if (codeRaw.endsWith('\r')) codeRaw.dropLast(1) else codeRaw
+                if (codeLine.trim().startsWith("```")) break
+                if (codeBuffer.isNotEmpty()) codeBuffer.append('\n')
+                codeBuffer.append(codeLine)
                 i++
             }
-            blocks.add(MarkdownBlock.CodeBlock(lang, codeLines.joinToString("\n")))
+            blocks.add(MarkdownBlock.CodeBlock(lang, codeBuffer.toString()))
             i++
             continue
         }
@@ -220,28 +226,26 @@ private fun parseMarkdownBlocks(input: String): List<MarkdownBlock> {
             continue
         }
 
-        val headingMatch = HEADING_REGEX.find(trimmed)
-        if (headingMatch != null) {
+        val heading = parseHeading(trimmed)
+        if (heading != null) {
             flushParagraph()
-            val level = headingMatch.groupValues[1].length
-            val text = headingMatch.groupValues[2]
-            blocks.add(MarkdownBlock.Heading(level, text))
+            blocks.add(heading)
             i++
             continue
         }
 
-        val bulletMatch = BULLET_REGEX.find(trimmed)
-        if (bulletMatch != null) {
+        val bullet = parseBullet(trimmed)
+        if (bullet != null) {
             flushParagraph()
-            blocks.add(MarkdownBlock.BulletItem("•", bulletMatch.groupValues[2]))
+            blocks.add(bullet)
             i++
             continue
         }
 
-        val numberedMatch = NUMBERED_REGEX.find(trimmed)
-        if (numberedMatch != null) {
+        val numbered = parseNumbered(trimmed)
+        if (numbered != null) {
             flushParagraph()
-            blocks.add(MarkdownBlock.BulletItem(numberedMatch.groupValues[1], numberedMatch.groupValues[2]))
+            blocks.add(numbered)
             i++
             continue
         }
@@ -256,20 +260,79 @@ private fun parseMarkdownBlocks(input: String): List<MarkdownBlock> {
     return blocks
 }
 
+private fun parseHeading(trimmed: String): MarkdownBlock.Heading? {
+    if (!trimmed.startsWith('#')) return null
+    var level = 0
+    while (level < 3 && level < trimmed.length && trimmed[level] == '#') {
+        level++
+    }
+    if (level == 0 || level >= trimmed.length || !trimmed[level].isWhitespace()) return null
+    val content = trimmed.substring(level).trimStart()
+    return if (content.isNotEmpty()) MarkdownBlock.Heading(level, content) else null
+}
+
+private fun parseBullet(trimmed: String): MarkdownBlock.BulletItem? {
+    if (trimmed.length < 3) return null
+    val first = trimmed[0]
+    if ((first == '-' || first == '*' || first == '•') && trimmed[1].isWhitespace()) {
+        val content = trimmed.substring(2).trimStart()
+        if (content.isNotEmpty()) {
+            return MarkdownBlock.BulletItem("•", content)
+        }
+    }
+    return null
+}
+
+private fun parseNumbered(trimmed: String): MarkdownBlock.BulletItem? {
+    var idx = 0
+    while (idx < trimmed.length && trimmed[idx].isDigit()) {
+        idx++
+    }
+    if (idx == 0 || idx + 1 >= trimmed.length) return null
+    if (trimmed[idx] == '.' && trimmed[idx + 1].isWhitespace()) {
+        val marker = trimmed.substring(0, idx + 1)
+        val content = trimmed.substring(idx + 2).trimStart()
+        if (content.isNotEmpty()) {
+            return MarkdownBlock.BulletItem(marker, content)
+        }
+    }
+    return null
+}
+
 private fun buildInlineAnnotatedString(
     text: String,
     inlineCodeBg: Color,
     defaultColor: Color
 ): AnnotatedString {
+    if (text.indexOfAny(INLINE_MARKERS) == -1) {
+        return AnnotatedString(text)
+    }
+    val boldStyle = SpanStyle(fontWeight = FontWeight.Bold, color = defaultColor)
+    val italicStyle = SpanStyle(fontStyle = FontStyle.Italic, color = defaultColor)
+    val codeStyle = SpanStyle(
+        fontFamily = JetBrainsMonoFontFamily,
+        background = inlineCodeBg.copy(alpha = 0.7f),
+        color = defaultColor
+    )
     return buildAnnotatedString {
         var idx = 0
-        while (idx < text.length) {
+        val length = text.length
+        while (idx < length) {
+            val nextMarker = text.indexOfAny(INLINE_MARKERS, startIndex = idx)
+            if (nextMarker == -1) {
+                append(text, idx, length)
+                break
+            }
+            if (nextMarker > idx) {
+                append(text, idx, nextMarker)
+                idx = nextMarker
+            }
             when {
                 text.startsWith("**", idx) -> {
                     val end = text.indexOf("**", idx + 2)
                     if (end != -1) {
-                        withStyle(SpanStyle(fontWeight = FontWeight.Bold, color = defaultColor)) {
-                            append(text.substring(idx + 2, end))
+                        withStyle(boldStyle) {
+                            append(text, idx + 2, end)
                         }
                         idx = end + 2
                     } else {
@@ -278,17 +341,13 @@ private fun buildInlineAnnotatedString(
                     }
                 }
 
-                text.startsWith("`", idx) -> {
+                text[idx] == '`' -> {
                     val end = text.indexOf('`', idx + 1)
                     if (end != -1) {
-                        withStyle(
-                            SpanStyle(
-                                fontFamily = JetBrainsMonoFontFamily,
-                                background = inlineCodeBg.copy(alpha = 0.7f),
-                                color = defaultColor
-                            )
-                        ) {
-                            append(" ${text.substring(idx + 1, end)} ")
+                        withStyle(codeStyle) {
+                            append(' ')
+                            append(text, idx + 1, end)
+                            append(' ')
                         }
                         idx = end + 1
                     } else {
@@ -297,22 +356,17 @@ private fun buildInlineAnnotatedString(
                     }
                 }
 
-                text.startsWith("*", idx) -> {
+                text[idx] == '*' -> {
                     val end = text.indexOf('*', idx + 1)
                     if (end != -1 && end > idx + 1) {
-                        withStyle(SpanStyle(fontStyle = FontStyle.Italic, color = defaultColor)) {
-                            append(text.substring(idx + 1, end))
+                        withStyle(italicStyle) {
+                            append(text, idx + 1, end)
                         }
                         idx = end + 1
                     } else {
                         append('*')
                         idx++
                     }
-                }
-
-                else -> {
-                    append(text[idx])
-                    idx++
                 }
             }
         }

@@ -88,13 +88,17 @@ fun AuthScreen(
         )
     }
 
-    val bgGradient = Brush.verticalGradient(
-        colors = listOf(
-            MaterialTheme.colorScheme.background,
-            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f),
-            MaterialTheme.colorScheme.background
+    val bgColor = MaterialTheme.colorScheme.background
+    val surfaceVariantColor = MaterialTheme.colorScheme.surfaceVariant
+    val bgGradient = remember(bgColor, surfaceVariantColor) {
+        Brush.verticalGradient(
+            colors = listOf(
+                bgColor,
+                surfaceVariantColor.copy(alpha = 0.42f),
+                bgColor
+            )
         )
-    )
+    }
 
     Box(
         modifier = modifier

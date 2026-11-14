@@ -12,6 +12,7 @@ import com.example.data.preferences.UserPreferencesRepository
 import com.example.data.remote.unwrapFirestoreException
 import com.example.data.repository.MooMooChatRepository
 import com.example.model.ChatMessage
+import com.example.model.ChatMessageRecord
 import com.example.model.ChatSender
 import com.example.model.ConversationRecord
 import com.example.model.MooMooModelTier
@@ -20,8 +21,10 @@ import com.example.model.toChatMessage
 import com.example.ui.theme.ThemeMode
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -181,6 +184,14 @@ class ChatViewModel(
         } else {
             syncProfileOnLaunch()
         }
+        viewModelScope.launch(Dispatchers.Default) {
+            val prefs = userPreferences.value
+            chatRepository.prewarmAiClient(
+                defaultTier = prefs.modelTier,
+                defaultMood = prefs.mood,
+                customInstruction = prefs.customInstruction
+            )
+        }
     }
 
     private fun syncProfileOnLaunch() {
@@ -332,6 +343,19 @@ class ChatViewModel(
         activeGenerationJob?.cancel()
         activeGenerationJob = viewModelScope.launch {
             val prefs = userPreferences.value
+            val priorRecords = messages.value
+                .filter { !it.isError }
+                .map { msg ->
+                    ChatMessageRecord(
+                        id = msg.id,
+                        userId = currentUserId,
+                        conversationId = _activeConversationId.value.orEmpty(),
+                        role = if (msg.sender == ChatSender.USER) "user" else "model",
+                        text = msg.text,
+                        imagePath = msg.imagePath,
+                        isError = false
+                    )
+                }
             val isNewConversation = _activeConversationId.value == null
             val conversationId = try {
                 _activeConversationId.value ?: run {
@@ -350,27 +374,33 @@ class ChatViewModel(
 
             val savedImagePath = imageUri?.let { chatRepository.persistAttachment(it) }
             val userText = rawText.ifBlank { "What's in this image?" }
+            val optimisticUserRecord = ChatMessageRecord(
+                id = "pending_user",
+                userId = currentUserId,
+                conversationId = conversationId,
+                role = "user",
+                text = userText,
+                imagePath = savedImagePath,
+                isError = false
+            )
 
-            try {
+            // Persist the user message concurrently while Gemini begins streaming immediately.
+            val saveUserDeferred = async {
                 chatRepository.saveMessage(
                     conversationId = conversationId,
                     role = "user",
                     text = userText,
                     imagePath = savedImagePath
                 )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Error saving message", e)
-                _cloudError.value = e.localizedMessage ?: "Unable to save message."
-                return@launch
             }
 
             val succeeded = streamModelResponse(
                 conversationId = conversationId,
                 modelTier = prefs.modelTier,
                 mood = prefs.mood,
-                customInstruction = prefs.customInstruction
+                customInstruction = prefs.customInstruction,
+                cachedHistory = priorRecords + optimisticUserRecord,
+                awaitPriorSave = { saveUserDeferred.await() }
             )
             if (isNewConversation && succeeded) {
                 launch {
@@ -392,17 +422,41 @@ class ChatViewModel(
         activeGenerationJob = viewModelScope.launch {
             val currentMessages = messages.value
             val lastMessage = currentMessages.lastOrNull()
-            if (lastMessage != null && (lastMessage.sender == ChatSender.MOO_MOO || lastMessage.isError)) {
-                runCatching {
-                    chatRepository.deleteMessage(conversationId, lastMessage.id)
-                }
+            val historySource = if (lastMessage != null && (lastMessage.sender == ChatSender.MOO_MOO || lastMessage.isError)) {
+                currentMessages.dropLast(1)
+            } else {
+                currentMessages
             }
+            val deleteDeferred = if (lastMessage != null && (lastMessage.sender == ChatSender.MOO_MOO || lastMessage.isError)) {
+                async {
+                    runCatching {
+                        chatRepository.deleteMessage(conversationId, lastMessage.id)
+                    }
+                }
+            } else {
+                null
+            }
+            val cachedRecords = historySource
+                .filter { !it.isError }
+                .map { msg ->
+                    ChatMessageRecord(
+                        id = msg.id,
+                        userId = currentUserId,
+                        conversationId = conversationId,
+                        role = if (msg.sender == ChatSender.USER) "user" else "model",
+                        text = msg.text,
+                        imagePath = msg.imagePath,
+                        isError = false
+                    )
+                }
             val prefs = userPreferences.value
             streamModelResponse(
                 conversationId = conversationId,
                 modelTier = prefs.modelTier,
                 mood = prefs.mood,
-                customInstruction = prefs.customInstruction
+                customInstruction = prefs.customInstruction,
+                cachedHistory = cachedRecords,
+                awaitPriorSave = { deleteDeferred?.await() }
             )
         }
     }
@@ -430,7 +484,9 @@ class ChatViewModel(
         conversationId: String,
         modelTier: MooMooModelTier,
         mood: MooMooMood,
-        customInstruction: String
+        customInstruction: String,
+        cachedHistory: List<ChatMessageRecord>? = null,
+        awaitPriorSave: (suspend () -> Unit)? = null
     ): Boolean {
         _generationState.value = GenerationUiState.Loading
         var lastEmitMs = 0L
@@ -439,14 +495,16 @@ class ChatViewModel(
                 conversationId = conversationId,
                 modelTier = modelTier,
                 mood = mood,
-                customInstruction = customInstruction
+                customInstruction = customInstruction,
+                cachedMessages = cachedHistory
             ) { accumulated ->
                 val now = android.os.SystemClock.uptimeMillis()
-                if (lastEmitMs == 0L || now - lastEmitMs >= 32L) {
+                if (lastEmitMs == 0L || now - lastEmitMs >= 48L) {
                     lastEmitMs = now
                     _generationState.value = GenerationUiState.Streaming(accumulated)
                 }
             }
+            awaitPriorSave?.invoke()
             chatRepository.saveMessage(
                 conversationId = conversationId,
                 role = "model",
@@ -458,6 +516,7 @@ class ChatViewModel(
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error generating Moo Moo reply", e)
+            runCatching { awaitPriorSave?.invoke() }
             val msg = e.localizedMessage?.takeIf { it.isNotBlank() }
                 ?: "Moo Moo ran into a snag reaching Gemini. Please try again."
             runCatching {
