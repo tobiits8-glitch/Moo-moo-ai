@@ -2,6 +2,7 @@ package com.example.ai
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.util.Log
 import com.example.BuildConfig
 import com.google.firebase.FirebaseApp
@@ -9,17 +10,61 @@ import com.google.firebase.FirebaseOptions
 import com.google.firebase.appcheck.FirebaseAppCheck
 import com.google.firebase.appcheck.debug.DebugAppCheckProviderFactory
 import com.google.firebase.appcheck.recaptcha.RecaptchaAppCheckProviderFactory
-import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "AppCheckInit"
 
 private const val DEBUG_TOKEN_EXTRA = "FIREBASE_APPCHECK_DEBUG_TOKEN"
 private const val DEBUG_STORE_PREFIX = "com.google.firebase.appcheck.debug.store."
 private const val DEBUG_SECRET_KEY = "com.google.firebase.appcheck.debug.DEBUG_SECRET"
+private const val TOKEN_STORE_PREFIX = "com.google.firebase.appcheck.store."
+private const val META_PREFS_NAME = "com.example.ai.APPCHECK_META"
+private const val META_HARNESS_TOKEN_PREFIX = "harness_debug_token_"
+private const val META_RECAPTCHA_MIGRATED_PREFIX = "recaptcha_migrated_"
 private const val RECAPTCHA_SITE_KEY_RES = "recaptcha_site_key"
 
+internal enum class AppCheckProviderMode {
+    DEBUG,
+    RECAPTCHA
+}
+
 private val initLock = Any()
-private val appCheckInstalled = AtomicBoolean(false)
+
+@Volatile
+private var installedMode: AppCheckProviderMode? = null
+
+@Volatile
+private var installedDebugSecret: String? = null
+
+fun isAppCheckConfigured(): Boolean = installedMode != null
+
+internal fun resolveAppCheckMode(
+    isDebugBuild: Boolean,
+    intentDebugToken: String?,
+    savedHarnessToken: String?,
+    recaptchaSiteKey: String?,
+    isRobolectric: Boolean
+): AppCheckProviderMode {
+    if (!isDebugBuild) {
+        return AppCheckProviderMode.RECAPTCHA
+    }
+    if (!intentDebugToken.isNullOrBlank() || !savedHarnessToken.isNullOrBlank()) {
+        return AppCheckProviderMode.DEBUG
+    }
+    if (!isRobolectric && !recaptchaSiteKey.isNullOrBlank()) {
+        return AppCheckProviderMode.RECAPTCHA
+    }
+    return AppCheckProviderMode.DEBUG
+}
+
+private fun resolveRecaptchaSiteKey(context: Context): String? {
+    val resId = context.resources.getIdentifier(
+        RECAPTCHA_SITE_KEY_RES,
+        "string",
+        context.packageName
+    )
+    if (resId == 0) return null
+    return context.getString(resId).trim().takeIf { it.isNotEmpty() }
+}
 
 /**
  * Ensures [FirebaseApp] is initialized in this process and returns true if ready.
@@ -53,48 +98,87 @@ fun configureAppCheck(context: Context, intent: Intent?) {
         }
 
         val persistenceKey = FirebaseApp.getInstance().persistenceKey
+        val metaPrefs = appContext.getSharedPreferences(META_PREFS_NAME, Context.MODE_PRIVATE)
+        val debugPrefs = appContext.getSharedPreferences(
+            "$DEBUG_STORE_PREFIX$persistenceKey",
+            Context.MODE_PRIVATE
+        )
+        val tokenPrefs = appContext.getSharedPreferences(
+            "$TOKEN_STORE_PREFIX$persistenceKey",
+            Context.MODE_PRIVATE
+        )
 
-        if (BuildConfig.DEBUG) {
-            val debugToken = intent?.getStringExtra(DEBUG_TOKEN_EXTRA)
+        val intentDebugToken = intent?.getStringExtra(DEBUG_TOKEN_EXTRA)?.trim()?.takeIf { it.isNotEmpty() }
+        if (BuildConfig.DEBUG && intentDebugToken != null) {
+            debugPrefs.edit()
+                .putString(DEBUG_SECRET_KEY, intentDebugToken)
+                .commit()
+            metaPrefs.edit()
+                .putString("$META_HARNESS_TOKEN_PREFIX$persistenceKey", intentDebugToken)
+                .putBoolean("$META_RECAPTCHA_MIGRATED_PREFIX$persistenceKey", false)
+                .commit()
+            Log.d(TAG, "App Check harness debug secret configured synchronously.")
+        }
 
-            if (!debugToken.isNullOrEmpty()) {
-                val prefs = appContext.getSharedPreferences(
-                    "$DEBUG_STORE_PREFIX$persistenceKey",
-                    Context.MODE_PRIVATE
-                )
-                prefs.edit()
-                    .putString(DEBUG_SECRET_KEY, debugToken)
-                    .commit()
-                Log.d(TAG, "App Check debug secret configured successfully.")
-            } else if (!appCheckInstalled.get()) {
-                Log.d(TAG, "No debug token found in Intent extra; using standard debug App Check provider.")
-            }
+        val savedHarnessToken = metaPrefs
+            .getString("$META_HARNESS_TOKEN_PREFIX$persistenceKey", null)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+        val recaptchaSiteKey = resolveRecaptchaSiteKey(appContext)
+        val isRobolectric = "robolectric".equals(Build.FINGERPRINT, ignoreCase = true)
 
-            if (appCheckInstalled.compareAndSet(false, true) || !debugToken.isNullOrEmpty()) {
-                FirebaseAppCheck.getInstance().installAppCheckProviderFactory(
-                    DebugAppCheckProviderFactory.getInstance()
-                )
-                Log.d(TAG, "DebugAppCheckProviderFactory installed.")
-            }
-        } else {
-            if (appCheckInstalled.compareAndSet(false, true)) {
-                val resId = appContext.resources.getIdentifier(
-                    RECAPTCHA_SITE_KEY_RES,
-                    "string",
-                    appContext.packageName
-                )
-                if (resId != 0) {
-                    val siteKey = appContext.getString(resId)
-                    if (siteKey.isNotBlank()) {
-                        FirebaseAppCheck.getInstance().installAppCheckProviderFactory(
-                            RecaptchaAppCheckProviderFactory.getInstance(siteKey)
-                        )
-                        Log.d(TAG, "RecaptchaAppCheckProviderFactory installed.")
-                    } else {
-                        Log.e(TAG, "recaptcha_site_key resource string is blank.")
+        val targetMode = resolveAppCheckMode(
+            isDebugBuild = BuildConfig.DEBUG,
+            intentDebugToken = intentDebugToken,
+            savedHarnessToken = savedHarnessToken,
+            recaptchaSiteKey = recaptchaSiteKey,
+            isRobolectric = isRobolectric
+        )
+
+        val appCheck = FirebaseAppCheck.getInstance()
+        when (targetMode) {
+            AppCheckProviderMode.DEBUG -> {
+                val effectiveSecret = intentDebugToken ?: savedHarnessToken
+                if (effectiveSecret != null && debugPrefs.getString(DEBUG_SECRET_KEY, null) != effectiveSecret) {
+                    debugPrefs.edit()
+                        .putString(DEBUG_SECRET_KEY, effectiveSecret)
+                        .commit()
+                }
+                val secretChanged = effectiveSecret != null && installedDebugSecret != null && installedDebugSecret != effectiveSecret
+                val modeChanged = installedMode != null && installedMode != AppCheckProviderMode.DEBUG
+                if (installedMode != AppCheckProviderMode.DEBUG || (intentDebugToken != null && installedDebugSecret != intentDebugToken)) {
+                    if (secretChanged || modeChanged) {
+                        tokenPrefs.edit().clear().commit()
                     }
-                } else {
-                    Log.e(TAG, "recaptcha_site_key string resource not found in package.")
+                    appCheck.installAppCheckProviderFactory(DebugAppCheckProviderFactory.getInstance())
+                    installedMode = AppCheckProviderMode.DEBUG
+                    installedDebugSecret = effectiveSecret
+                    if (secretChanged || modeChanged) {
+                        appCheck.getAppCheckToken(true)
+                    }
+                    Log.d(TAG, "DebugAppCheckProviderFactory installed.")
+                }
+            }
+
+            AppCheckProviderMode.RECAPTCHA -> {
+                if (recaptchaSiteKey == null) {
+                    Log.e(TAG, "recaptcha_site_key string resource not found or blank in package.")
+                    return
+                }
+                val migratedKey = "$META_RECAPTCHA_MIGRATED_PREFIX$persistenceKey"
+                if (!metaPrefs.getBoolean(migratedKey, false)) {
+                    // Remove any unregistered random UUID / invalid token left behind by an earlier debug launch.
+                    debugPrefs.edit().clear().commit()
+                    tokenPrefs.edit().clear().commit()
+                    metaPrefs.edit().putBoolean(migratedKey, true).commit()
+                }
+                if (installedMode != AppCheckProviderMode.RECAPTCHA) {
+                    appCheck.installAppCheckProviderFactory(
+                        RecaptchaAppCheckProviderFactory.getInstance(recaptchaSiteKey)
+                    )
+                    installedMode = AppCheckProviderMode.RECAPTCHA
+                    installedDebugSecret = null
+                    Log.d(TAG, "RecaptchaAppCheckProviderFactory installed.")
                 }
             }
         }

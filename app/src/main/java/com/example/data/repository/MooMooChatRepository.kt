@@ -12,6 +12,7 @@ import android.util.Log
 import com.example.R
 import com.example.ai.configureAppCheck
 import com.example.ai.ensureFirebaseInitialized
+import com.example.ai.isAppCheckConfigured
 import com.example.data.remote.OperationType
 import com.example.data.remote.handleFirestoreError
 import com.example.model.ChatMessageRecord
@@ -140,14 +141,14 @@ class MooMooChatRepository private constructor(
     }
 
     private fun ensureFirebaseReadyOrThrow() {
-        if (FirebaseApp.getApps(appContext).isEmpty()) {
-            configureAppCheck(appContext, null)
-        }
         if (!ensureFirebaseInitialized(appContext)) {
             throw IllegalStateException(
                 "Firebase is not configured in this APK build (missing google-services.json). " +
                     "Ensure google-services.json is included before building."
             )
+        }
+        if (!isAppCheckConfigured()) {
+            configureAppCheck(appContext, null)
         }
     }
 
@@ -743,13 +744,32 @@ class MooMooChatRepository private constructor(
         Log.d(TAG, "Starting Moo Moo reply via ${modelTier.modelName} (history=${historyContents.size})")
 
         try {
-            val primaryStream = tryStream(
-                model = primaryModel,
-                historyContents = historyContents,
-                userPromptContent = userPromptContent,
-                inactivityTimeoutMs = STREAM_INACTIVITY_TIMEOUT_MS,
-                onChunk = onChunk
-            )
+            val primaryStream = try {
+                tryStream(
+                    model = primaryModel,
+                    historyContents = historyContents,
+                    userPromptContent = userPromptContent,
+                    inactivityTimeoutMs = STREAM_INACTIVITY_TIMEOUT_MS,
+                    onChunk = onChunk
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!isAppCheckFailure(e)) throw e
+                Log.w(TAG, "App Check token rejected; refreshing token once before retrying.", e)
+                runCatching {
+                    FirebaseAppCheck.getInstance().getAppCheckToken(true).await()
+                }.onFailure { refreshErr ->
+                    Log.w(TAG, "Forced App Check token refresh failed", refreshErr)
+                }
+                tryStream(
+                    model = primaryModel,
+                    historyContents = historyContents,
+                    userPromptContent = userPromptContent,
+                    inactivityTimeoutMs = STREAM_INACTIVITY_TIMEOUT_MS,
+                    onChunk = onChunk
+                )
+            }
             if (primaryStream != null) return primaryStream
 
             val allTurnContents = historyContents + userPromptContent
@@ -788,6 +808,15 @@ class MooMooChatRepository private constructor(
             Log.e(TAG, "Firebase AI chat failed", e)
             throw e
         }
+    }
+
+    private fun isAppCheckFailure(error: Throwable): Boolean {
+        return generateSequence(error) { it.cause }
+            .mapNotNull { it.message }
+            .any { msg ->
+                msg.contains("app check", ignoreCase = true) ||
+                    msg.contains("appcheck", ignoreCase = true)
+            }
     }
 
     suspend fun generateConversationTitle(
